@@ -1,268 +1,505 @@
 from __future__ import annotations
 
-import logging
 import re
-import shutil
-import tempfile
 import unicodedata
+import tempfile
 import zipfile
-from datetime import date, datetime, timedelta
+from io import StringIO
 from pathlib import Path
+from datetime import datetime, timedelta, date
+from typing import Optional, List
 from urllib.parse import urljoin
 
+import numpy as np
 import pandas as pd
 import requests
-import streamlit as st
 from bs4 import BeautifulSoup
-
-from rd_data_multiarquivo.config import get_config
-from rd_data_multiarquivo.logging_utils import setup_logger
-from rd_data_multiarquivo.validators import validate_config
-from rd_data_multiarquivo.collectors import collect_data
-from rd_data_multiarquivo.processors import process_data
-from rd_data_multiarquivo.exporters import (
-    build_export_tables,
-    export_to_excel,
-    build_execution_summary,
-    log_execution_summary,
-)
-from rd_data_multiarquivo.naming import standardize_column_names
+from sidrapy import get_table
 
 
 # =========================================================
-# Logging para interface
+# CONFIGURAÇÃO GERAL
 # =========================================================
-class StreamlitLogHandler(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.messages = []
+START_YEAR = 2019
+END_YEAR = datetime.today().year
+OUTPUT_NAME = "replica_indicadores_publicos_brasil.xlsx"
 
-    def emit(self, record):
-        msg = self.format(record)
-        self.messages.append(msg)
+# Se None, busca o RMD na web automaticamente.
+# Se quiser forçar um arquivo local, preencha com o caminho.
+RMD_FILE: Optional[str] = None
+
+RMD_LOOKBACK_MONTHS = 18
+
+PT_MESES = {
+    "Jan": 1, "Fev": 2, "Mar": 3, "Abr": 4, "Mai": 5, "Jun": 6,
+    "Jul": 7, "Ago": 8, "Set": 9, "Out": 10, "Nov": 11, "Dez": 12,
+}
+PT_MESES_MIN = {
+    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+}
+PAT_MES_ANO = re.compile(r"^(Jan|Fev|Mar|Abr|Mai|Jun|Jul|Ago|Set|Out|Nov|Dez)/\d{2}$")
 
 
 # =========================================================
-# Utilidades gerais
+# MAPEAMENTO DE SÉRIES SGS
 # =========================================================
-def normalize_text(text: str) -> str:
-    text = str(text).strip().lower()
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return text
+SGS = {
+    # PIB / anual
+    "pib_nominal_brl": 1207,
+    "pib_nominal_usd": 7324,
+    "pib_real_growth": 7326,
+    "pib_per_capita_usd": 21776,
+    "cambio_fim": 3692,
+    "cambio_medio_anual": 3694,
+    "export_usd_bi": 23468,
+    "import_usd_bi": 23469,
+    "transacoes_correntes_usd_bi": 23461,
+    "conta_capital_usd_bi": 23611,
+    "conta_financeira_usd_bi": 23623,
+    "ativo_reservas_usd_bi": 23803,
+    "reservas_internacionais_usd_bi": 3545,
+    "deflator_implicito": 1211,
+
+    # Mensal / monetário
+    "ipca_12m": 13522,
+    "igp_di_mensal": 190,
+    "selic_acum_mes": 4390,
+    "cambio_medio_mensal": 3698,
+    "cambio_diario": 1,
+    "tjlp": 256,
+    "tlp": 27572,
+    "reservas_estoque": 3546,
+    "inadimplencia_total": 21082,
+    "inadimplencia_pf": 21112,
+    "inadimplencia_pj": 21086,
+    "inadimplencia_recursos_livres": 21085,
+
+    # Crédito
+    "credito_total_brl": 20539,
+    "credito_total_pct_pib": 20622,
+
+    # Setor externo mensal
+    "transacoes_correntes_mensal": 22701,
+    "transacoes_correntes_pct_pib": 23079,
+    "conta_capital_mensal": 22851,
+    "conta_financeira_mensal": 22863,
+    "idp_mensal": 22885,
+    "idp_pct_pib": 23080,
+
+    # Fiscal mensal
+    "resultado_primario_governo_central": 5497,
+    "resultado_primario_consolidado": 5793,
+    "resultado_nominal_gc_corrente": 4573,
+    "resultado_primario_gc_corrente": 4639,
+    "resultado_nominal_gc_12m": 5002,
+    "resultado_primario_gc_12m": 5068,
+    "resultado_nominal_spc_corrente": 4583,
+    "resultado_primario_spc_corrente": 4649,
+    "resultado_nominal_spc_12m": 5012,
+    "resultado_primario_spc_12m": 5078,
+    "dbgg_valor": 13761,
+    "dbgg_pct_pib": 13762,
+    "dlsp_valor": 4478,
+    "dlsp_pct_pib": 4513,
+}
 
 
-def current_file_signature(path: Path) -> str:
-    stat = path.stat()
-    return f"{path.resolve()}|{int(stat.st_mtime)}|{stat.st_size}"
-
-
-def prepare_preview_df(df: pd.DataFrame, max_rows: int = 50) -> pd.DataFrame:
+# =========================================================
+# HELPERS GERAIS
+# =========================================================
+def normalize_text(s: str) -> str:
     """
-    Mostra automaticamente as linhas mais recentes.
+    Normaliza texto para busca robusta:
+    - remove acentos
+    - baixa caixa
+    - remove espaços duplicados
     """
-    df_view = df.copy()
-
-    date_col = None
-    year_col = None
-
-    for candidate in ["data", "Data"]:
-        if candidate in df_view.columns:
-            date_col = candidate
-            break
-
-    for candidate in ["ano", "Ano"]:
-        if candidate in df_view.columns:
-            year_col = candidate
-            break
-
-    if date_col:
-        df_view[date_col] = pd.to_datetime(df_view[date_col], errors="coerce")
-        df_view = (
-            df_view.sort_values(date_col, ascending=False)
-            .head(max_rows)
-            .reset_index(drop=True)
-        )
-    elif year_col:
-        df_view[year_col] = pd.to_numeric(df_view[year_col], errors="coerce")
-        df_view = (
-            df_view.sort_values(year_col, ascending=False)
-            .head(max_rows)
-            .reset_index(drop=True)
-        )
-    else:
-        df_view = df_view.tail(max_rows).reset_index(drop=True)
-
-    return df_view
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-# =========================================================
-# Descoberta LOCAL do RMD
-# =========================================================
-def month_name_to_number(token: str) -> int | None:
-    token = normalize_text(token)
-
-    month_map = {
-        "jan": 1,
-        "janeiro": 1,
-        "fev": 2,
-        "fevereiro": 2,
-        "mar": 3,
-        "marco": 3,
-        "março": 3,
-        "abr": 4,
-        "abril": 4,
-        "mai": 5,
-        "maio": 5,
-        "jun": 6,
-        "junho": 6,
-        "jul": 7,
-        "julho": 7,
-        "ago": 8,
-        "agosto": 8,
-        "set": 9,
-        "setembro": 9,
-        "out": 10,
-        "outubro": 10,
-        "nov": 11,
-        "novembro": 11,
-        "dez": 12,
-        "dezembro": 12,
-    }
-
-    return month_map.get(token)
-
-
-def is_excel_temp_file(path: Path) -> bool:
-    return path.name.startswith("~$")
-
-
-def is_hidden_file(path: Path) -> bool:
-    return path.name.startswith(".")
-
-
-def looks_like_rmd_file(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    if path.suffix.lower() != ".xlsx":
-        return False
-    if is_excel_temp_file(path):
-        return False
-    if is_hidden_file(path):
-        return False
-
-    name = normalize_text(path.stem)
-    keywords = ["rmd", "anexo_rmd", "anexo-rmd", "anexo rmd", "divida", "dpf"]
-    return any(k in name for k in keywords)
-
-
-def parse_rmd_month_year_from_name(file_path: Path) -> tuple[int, int] | None:
+def normalize_text_strict(s: str) -> str:
     """
-    Tenta extrair (ano, mês) do nome do arquivo.
-    Exemplos:
-      - Anexo_RMD_Janeiro_26.xlsx
-      - Anexo-RMD-Fev-2026.xlsx
-      - RMD mar 25.xlsx
-      - anexo.rmd.dez.2023.xlsx
+    Versão mais agressiva para matching de labels.
     """
-    stem = normalize_text(file_path.stem)
-    tokens = [t for t in re.split(r"[_\-\s\.]+", stem) if t]
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-    month_num = None
-    year_num = None
 
-    for token in tokens:
-        if month_num is None:
-            maybe_month = month_name_to_number(token)
-            if maybe_month is not None:
-                month_num = maybe_month
-                continue
+def normalize_date_text(s: str) -> str:
+    """
+    Normalização específica para datas/meses.
+    Preserva '/' para formatos como Dez/00, Jan/26, 01/2026.
+    """
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.replace("-", "/")
+    s = re.sub(r"[^a-z0-9/]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-        if year_num is None and re.fullmatch(r"\d{2}|\d{4}", token):
-            y = int(token)
-            year_num = 2000 + y if y < 100 else y
 
-    if month_num is not None and year_num is not None:
-        return year_num, month_num
-
-    month_regex = (
-        r"(jan(?:eiro)?|fev(?:ereiro)?|mar(?:co|ço)?|abr(?:il)?|mai(?:o)?|"
-        r"jun(?:ho)?|jul(?:ho)?|ago(?:sto)?|set(?:embro)?|out(?:ubro)?|"
-        r"nov(?:embro)?|dez(?:embro)?)"
+def fetch_sgs(code: int, start_year: str, end_year: str | None = None) -> pd.Series:
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados?formato=json&dataInicial=01/01/{start_year}"
+    if end_year:
+        url += f"&dataFinal=31/12/{end_year}"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    df = pd.read_json(StringIO(r.text))
+    if df.empty:
+        return pd.Series(dtype="float64")
+    df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
+    df["valor"] = pd.to_numeric(
+        df["valor"].astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
     )
-    year_regex = r"(\d{2}|\d{4})"
+    return df.set_index("data")["valor"].sort_index()
 
-    match = re.search(month_regex + r".*?" + year_regex, stem)
-    if not match:
-        match = re.search(year_regex + r".*?" + month_regex, stem)
 
-    if match:
-        parts = match.groups()
-        month_token = None
-        year_token = None
+def _find_text_cols(raw: pd.DataFrame) -> List[str]:
+    return [c for c in raw.columns if c.startswith("D") and (c.endswith("C") or c.endswith("N"))]
 
-        for part in parts:
-            if re.fullmatch(r"\d{2}|\d{4}", part):
-                year_token = part
-            else:
-                month_token = part
 
-        if month_token and year_token:
-            m = month_name_to_number(month_token)
-            y = int(year_token)
-            y = 2000 + y if y < 100 else y
-            if m is not None:
-                return y, m
+def _find_period_col(raw: pd.DataFrame) -> str:
+    text_cols = _find_text_cols(raw)
+    if not text_cols:
+        raise ValueError(f"Não encontrei colunas D*C/D*N. Colunas: {list(raw.columns)}")
+    return text_cols[0]
 
+
+def _build_normalized_mask(
+    raw: pd.DataFrame,
+    search_terms: List[str],
+    text_cols: Optional[List[str]] = None,
+) -> pd.Series:
+    """
+    Procura os termos em todas as colunas textuais do raw,
+    com normalização de acentos/caixa/espaços.
+    """
+    if text_cols is None:
+        text_cols = _find_text_cols(raw)
+    search_terms_norm = [normalize_text(x) for x in search_terms if x]
+    mask = pd.Series(False, index=raw.index)
+    for c in text_cols:
+        col_norm = raw[c].astype(str).map(normalize_text)
+        for term in search_terms_norm:
+            mask = mask | col_norm.str.contains(term, regex=False, na=False)
+    return mask
+
+
+def _sidra_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+
+
+def _detect_year_col(raw: pd.DataFrame) -> Optional[str]:
+    text_cols = _find_text_cols(raw)
+    for c in text_cols:
+        vals = raw[c].astype(str).str.strip()
+        if vals.str.fullmatch(r"\d{4}", na=False).any():
+            return c
     return None
 
 
-def build_local_rmd_rank(path: Path) -> tuple:
-    parsed = parse_rmd_month_year_from_name(path)
-    mtime = path.stat().st_mtime
-    normalized_name = normalize_text(path.name)
-
-    if parsed is not None:
-        year_num, month_num = parsed
-        return (2, year_num, month_num, mtime, normalized_name)
-
-    return (1, 0, 0, mtime, normalized_name)
-
-
-def get_rmd_search_dir_from_config(cfg: dict) -> Path:
-    configured = str(cfg.get("ARQUIVO_RMD", "")).strip()
-
-    if not configured:
-        return Path("rmd")
-
-    p = Path(configured)
-
-    if p.suffix:
-        parent = p.parent
-        return parent if str(parent) not in ("", ".") else Path("rmd")
-
-    return p
+def _detect_quarter_period_col(raw: pd.DataFrame) -> str:
+    text_cols = _find_text_cols(raw)
+    quarter_patterns = [
+        r"^\d{6}$",
+        r"^\d{4}\.\d$",
+        r"^\d{4}/\d$",
+        r"^\d{4}\s+\d$",
+        r"^[1-4].*trimestre.*\d{4}$",
+        r"^\d{4}.*[1-4]$",
+    ]
+    for c in text_cols:
+        vals = raw[c].astype(str).map(normalize_text)
+        for pat in quarter_patterns:
+            if vals.str.contains(pat, regex=True, na=False).any():
+                return c
+    return _find_period_col(raw)
 
 
-def find_latest_local_rmd_file(rmd_dir: str | Path = "rmd") -> Path:
-    rmd_dir = Path(rmd_dir)
+def _parse_quarter_to_timestamp(s: str) -> pd.Timestamp:
+    txt = normalize_text(s)
 
-    if not rmd_dir.exists():
-        raise FileNotFoundError(f"Pasta de RMD não encontrada: {rmd_dir}")
+    m = re.fullmatch(r"(\d{4})(0[1-4]|[1-4])", txt)
+    if m:
+        ano = int(m.group(1))
+        tri = int(m.group(2))
+        mes = tri * 3 - 2
+        return pd.Timestamp(year=ano, month=mes, day=1)
 
-    candidates = [p for p in rmd_dir.rglob("*.xlsx") if looks_like_rmd_file(p)]
-    if not candidates:
-        raise FileNotFoundError(
-            f"Nenhum arquivo RMD válido (.xlsx) foi encontrado em: {rmd_dir}"
-        )
+    m = re.fullmatch(r"(\d{4})[./\s]+([1-4])", txt)
+    if m:
+        ano = int(m.group(1))
+        tri = int(m.group(2))
+        mes = tri * 3 - 2
+        return pd.Timestamp(year=ano, month=mes, day=1)
 
-    ranked = [(build_local_rmd_rank(p), p) for p in candidates]
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return ranked[0][1]
+    m = re.search(r"([1-4]).*trimestre.*?(\d{4})", txt)
+    if m:
+        tri = int(m.group(1))
+        ano = int(m.group(2))
+        mes = tri * 3 - 2
+        return pd.Timestamp(year=ano, month=mes, day=1)
+
+    m = re.search(r"(\d{4}).*?t\s*([1-4])", txt)
+    if m:
+        ano = int(m.group(1))
+        tri = int(m.group(2))
+        mes = tri * 3 - 2
+        return pd.Timestamp(year=ano, month=mes, day=1)
+
+    m1 = re.search(r"(\d{4}).*?([1-4])", txt)
+    m2 = re.search(r"([1-4]).*?(\d{4})", txt)
+    if m1:
+        ano = int(m1.group(1))
+        tri = int(m1.group(2))
+        mes = tri * 3 - 2
+        return pd.Timestamp(year=ano, month=mes, day=1)
+    if m2:
+        tri = int(m2.group(1))
+        ano = int(m2.group(2))
+        mes = tri * 3 - 2
+        return pd.Timestamp(year=ano, month=mes, day=1)
+
+    raise ValueError(f"Período trimestral inesperado: {s}")
 
 
 # =========================================================
-# Descoberta WEB do RMD
+# HELPERS SIDRA
+# =========================================================
+def sidra_annual_named_series(
+    table_code: str,
+    target_text: str,
+    value_name: str,
+    period: str = "all",
+    aliases: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    raw = get_table(
+        table_code=table_code,
+        territorial_level="1",
+        ibge_territorial_code="1",
+        period=period,
+    )
+    raw = pd.DataFrame(raw).iloc[1:].copy()
+
+    period_col = _detect_year_col(raw)
+    if period_col is None:
+        period_col = _find_period_col(raw)
+
+    text_cols = [c for c in _find_text_cols(raw) if c != period_col]
+    search_terms = [target_text] + (aliases or [])
+    mask = _build_normalized_mask(raw, search_terms, text_cols=text_cols)
+    filtered = raw[mask].copy()
+
+    if filtered.empty:
+        raise ValueError(f"Não encontrei '{target_text}' na tabela {table_code}")
+
+    df = filtered[[period_col, "V"]].copy()
+    df.columns = ["ano", value_name]
+    df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+    df[value_name] = _sidra_numeric(df[value_name])
+
+    return (
+        df.dropna(subset=["ano"])
+        .groupby("ano", as_index=False)[value_name]
+        .first()
+        .sort_values("ano")
+        .reset_index(drop=True)
+    )
+
+
+def sidra_annual_series_fallback(
+    table_code: str,
+    target_text: str,
+    value_name: str,
+    period: str = "all",
+    aliases: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    candidates = [target_text] + (aliases or [])
+    last_exc: Optional[Exception] = None
+
+    for candidate in candidates:
+        try:
+            extra_aliases = [x for x in candidates if x != candidate]
+            return sidra_annual_named_series(
+                table_code=table_code,
+                target_text=candidate,
+                value_name=value_name,
+                period=period,
+                aliases=extra_aliases,
+            )
+        except Exception as exc:
+            last_exc = exc
+
+    raise ValueError(
+        f"Não encontrei a série anual '{target_text}' na tabela {table_code}. Último erro: {last_exc}"
+    )
+
+
+def sidra_quarterly_named_series(
+    table_code: str,
+    target_text: str,
+    value_name: str,
+    period: str = "all",
+    aliases: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    raw = get_table(
+        table_code=table_code,
+        territorial_level="1",
+        ibge_territorial_code="1",
+        period=period,
+    )
+    raw = pd.DataFrame(raw).iloc[1:].copy()
+
+    period_col = _detect_quarter_period_col(raw)
+    text_cols = [c for c in _find_text_cols(raw) if c != period_col]
+
+    search_terms = [target_text] + (aliases or [])
+    mask = _build_normalized_mask(raw, search_terms, text_cols=text_cols)
+    filtered = raw[mask].copy()
+
+    if filtered.empty:
+        raise ValueError(f"Não encontrei '{target_text}' na tabela trimestral {table_code}")
+
+    df = filtered[[period_col, "V"]].copy()
+    df.columns = ["periodo", value_name]
+    df["periodo"] = df["periodo"].astype(str)
+    df["data"] = df["periodo"].apply(_parse_quarter_to_timestamp)
+    df[value_name] = _sidra_numeric(df[value_name])
+
+    return (
+        df[["data", value_name]]
+        .dropna(subset=["data"])
+        .sort_values("data")
+        .groupby("data", as_index=False)[value_name]
+        .first()
+        .reset_index(drop=True)
+    )
+
+
+def sidra_quarterly_single_series_mean_by_year(
+    table_code: str,
+    value_name: str,
+    period: str = "all",
+) -> pd.DataFrame:
+    raw = get_table(
+        table_code=table_code,
+        territorial_level="1",
+        ibge_territorial_code="1",
+        period=period,
+    )
+    raw = pd.DataFrame(raw).iloc[1:].copy()
+
+    if raw.empty:
+        raise ValueError(f"Tabela SIDRA {table_code} retornou vazia.")
+
+    period_col = _detect_quarter_period_col(raw)
+    if "V" not in raw.columns:
+        raise ValueError(f"Tabela SIDRA {table_code} não possui coluna 'V'. Colunas: {list(raw.columns)}")
+
+    df = raw[[period_col, "V"]].copy()
+    df.columns = ["periodo", value_name]
+    df["periodo"] = df["periodo"].astype(str)
+    df["data"] = df["periodo"].apply(_parse_quarter_to_timestamp)
+    df[value_name] = _sidra_numeric(df[value_name])
+
+    df = (
+        df[["data", value_name]]
+        .dropna(subset=["data"])
+        .sort_values("data")
+        .groupby("data", as_index=False)[value_name]
+        .first()
+    )
+
+    df["ano"] = df["data"].dt.year
+    return (
+        df.groupby("ano", as_index=False)[value_name]
+        .mean()
+        .sort_values("ano")
+        .reset_index(drop=True)
+    )
+
+
+def sidra_unemployment_4099_mean_by_year(period: str = "all") -> pd.DataFrame:
+    raw = get_table(
+        table_code="4099",
+        territorial_level="1",
+        ibge_territorial_code="1",
+        period=period,
+    )
+    raw = pd.DataFrame(raw).iloc[1:].copy()
+
+    if raw.empty:
+        raise ValueError("Tabela SIDRA 4099 retornou vazia.")
+
+    period_col = _detect_quarter_period_col(raw)
+    text_cols = [c for c in _find_text_cols(raw) if c != period_col]
+
+    search_terms = [
+        "Taxa de desocupação, na semana de referência, das pessoas de 14 anos ou mais de idade",
+        "Taxa de desocupação",
+        "taxa de desocupacao",
+    ]
+    mask = _build_normalized_mask(raw, search_terms, text_cols=text_cols)
+    filtered = raw[mask].copy()
+
+    if filtered.empty:
+        raise ValueError("Não encontrei a variável de taxa de desocupação na tabela 4099.")
+
+    excl = pd.Series(False, index=filtered.index)
+    for c in text_cols:
+        col_norm = filtered[c].astype(str).map(normalize_text)
+        excl = excl | col_norm.str.contains("coeficiente", regex=False, na=False)
+        excl = excl | col_norm.str.contains("subutilizacao", regex=False, na=False)
+        excl = excl | col_norm.str.contains("forca de trabalho potencial", regex=False, na=False)
+        excl = excl | col_norm.str.contains("insuficiencia de horas", regex=False, na=False)
+    filtered = filtered[~excl].copy()
+
+    df = filtered[[period_col, "V"]].copy()
+    df.columns = ["periodo", "unemployment_rate_pct_workforce"]
+    df["periodo"] = df["periodo"].astype(str)
+    df["data"] = df["periodo"].apply(_parse_quarter_to_timestamp)
+    df["unemployment_rate_pct_workforce"] = _sidra_numeric(df["unemployment_rate_pct_workforce"])
+
+    df = (
+        df[["data", "unemployment_rate_pct_workforce"]]
+        .dropna(subset=["data"])
+        .sort_values("data")
+        .groupby("data", as_index=False)["unemployment_rate_pct_workforce"]
+        .first()
+    )
+
+    df["ano"] = df["data"].dt.year
+    df = (
+        df.groupby("ano", as_index=False)["unemployment_rate_pct_workforce"]
+        .mean()
+        .sort_values("ano")
+        .reset_index(drop=True)
+    )
+    return df
+
+
+# =========================================================
+# RMD / WEB
 # =========================================================
 def build_rmd_page_url(year: int, month: int) -> str:
     return (
@@ -273,6 +510,106 @@ def build_rmd_page_url(year: int, month: int) -> str:
 
 def build_rmd_base_url() -> str:
     return "https://www.tesourotransparente.gov.br/publicacoes/relatorio-mensal-da-divida-rmd/"
+
+
+def iter_recent_year_months(max_lookback_months: int = 18):
+    today = date.today()
+    y, m = today.year, today.month
+
+    for _ in range(max_lookback_months):
+        yield y, m
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+
+
+def fetch_html(url: str, timeout: int = 60) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+
+def collect_link_candidates_from_html(page_url: str, html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = []
+
+    def add_candidate(raw_url: str, text: str, source_attr: str):
+        if not raw_url:
+            return
+        full_url = urljoin(page_url, raw_url.strip())
+        text = (text or "").strip()
+        candidates.append(
+            {
+                "attachment_url": full_url,
+                "anchor_text": text,
+                "source_attr": source_attr,
+            }
+        )
+
+    for a in soup.find_all("a"):
+        text = a.get_text(" ", strip=True)
+        for attr in ["href", "data-href", "data-url", "data-download", "download"]:
+            raw = a.get(attr)
+            if raw:
+                add_candidate(raw, text, attr)
+
+    for tag in soup.find_all(attrs={"data-href": True}):
+        add_candidate(tag.get("data-href"), tag.get_text(" ", strip=True), "data-href")
+
+    for tag in soup.find_all(attrs={"data-url": True}):
+        add_candidate(tag.get("data-url"), tag.get_text(" ", strip=True), "data-url")
+
+    return candidates
+
+
+def score_attachment_candidate(candidate: dict, target_year: int | None = None, target_month: int | None = None) -> int:
+    url_low = candidate["attachment_url"].lower()
+    text_low = normalize_text(candidate.get("anchor_text", ""))
+
+    score = 0
+
+    if ".xlsx" in url_low:
+        score += 8
+    if ".zip" in url_low:
+        score += 7
+    if ".pdf" in url_low:
+        score -= 5
+
+    if "anexo" in url_low or "anexo" in text_low:
+        score += 5
+    if "rmd" in url_low or "rmd" in text_low:
+        score += 5
+    if "tabela" in url_low or "tabela" in text_low:
+        score += 2
+
+    if target_year is not None and target_month is not None:
+        yy2 = str(target_year)[-2:]
+        month_pt = normalize_text(month_number_to_pt_name(target_month))
+        month_pt_ascii = normalize_text(month_number_to_pt_name_ascii(target_month))
+        normalized_url = normalize_text(url_low)
+
+        if str(target_year) in url_low or str(target_year) in text_low:
+            score += 3
+        if yy2 in url_low or yy2 in text_low:
+            score += 2
+        if month_pt in normalized_url or month_pt in text_low:
+            score += 4
+        if month_pt_ascii in normalized_url or month_pt_ascii in text_low:
+            score += 4
+
+    return score
 
 
 def month_number_to_pt_name(month: int) -> str:
@@ -311,148 +648,21 @@ def month_number_to_pt_name_ascii(month: int) -> str:
     return mapping[month]
 
 
-def iter_recent_year_months(max_lookback_months: int = 18):
-    """
-    Gera pares (ano, mês) do mês atual para trás.
-    """
-    today = date.today()
-    y, m = today.year, today.month
-
-    for _ in range(max_lookback_months):
-        yield y, m
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-
-
-def fetch_html(url: str, timeout: int = 60) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp.text
-
-
-def collect_link_candidates_from_html(page_url: str, html: str) -> list[dict]:
-    """
-    Coleta candidatos de link a partir de href e atributos alternativos.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    candidates = []
-
-    def add_candidate(raw_url: str, text: str, source_attr: str):
-        if not raw_url:
-            return
-
-        full_url = urljoin(page_url, raw_url.strip())
-        text = (text or "").strip()
-
-        candidates.append(
-            {
-                "attachment_url": full_url,
-                "anchor_text": text,
-                "source_attr": source_attr,
-            }
-        )
-
-    for a in soup.find_all("a"):
-        text = a.get_text(" ", strip=True)
-
-        for attr in ["href", "data-href", "data-url", "data-download", "download"]:
-            raw = a.get(attr)
-            if raw:
-                add_candidate(raw, text, attr)
-
-    for tag in soup.find_all(attrs={"data-href": True}):
-        add_candidate(tag.get("data-href"), tag.get_text(" ", strip=True), "data-href")
-
-    for tag in soup.find_all(attrs={"data-url": True}):
-        add_candidate(tag.get("data-url"), tag.get_text(" ", strip=True), "data-url")
-
-    return candidates
-
-
-def score_attachment_candidate(
-    candidate: dict,
-    target_year: int | None = None,
-    target_month: int | None = None,
-) -> int:
-    url_low = candidate["attachment_url"].lower()
-    text_low = normalize_text(candidate.get("anchor_text", ""))
-
-    score = 0
-
-    if ".xlsx" in url_low:
-        score += 8
-    if ".zip" in url_low:
-        score += 7
-    if ".pdf" in url_low:
-        score -= 5
-
-    if "anexo" in url_low or "anexo" in text_low:
-        score += 5
-    if "rmd" in url_low or "rmd" in text_low:
-        score += 5
-    if "tabela" in url_low or "tabela" in text_low:
-        score += 2
-
-    if target_year is not None and target_month is not None:
-        yy2 = str(target_year)[-2:]
-        month_pt = normalize_text(month_number_to_pt_name(target_month))
-        month_pt_ascii = normalize_text(month_number_to_pt_name_ascii(target_month))
-
-        normalized_url = normalize_text(url_low)
-
-        if str(target_year) in url_low or str(target_year) in text_low:
-            score += 3
-        if yy2 in url_low or yy2 in text_low:
-            score += 2
-        if month_pt in normalized_url or month_pt in text_low:
-            score += 4
-        if month_pt_ascii in normalized_url or month_pt_ascii in text_low:
-            score += 4
-
-    return score
-
-
-def find_rmd_attachment_in_page(
-    page_url: str,
-    target_year: int | None = None,
-    target_month: int | None = None,
-) -> dict:
+def find_rmd_attachment_in_page(page_url: str, target_year: int | None = None, target_month: int | None = None) -> dict:
     html = fetch_html(page_url, timeout=60)
     candidates = collect_link_candidates_from_html(page_url, html)
 
     if not candidates:
-        raise FileNotFoundError(
-            f"Nenhum link candidato foi encontrado na página: {page_url}"
-        )
+        raise FileNotFoundError(f"Nenhum link candidato foi encontrado na página: {page_url}")
 
     scored = []
     for c in candidates:
-        score = score_attachment_candidate(
-            c,
-            target_year=target_year,
-            target_month=target_month,
-        )
+        score = score_attachment_candidate(c, target_year=target_year, target_month=target_month)
         scored.append({**c, "score": score})
 
     scored = [c for c in scored if c["score"] > 0]
-
     if not scored:
-        raise FileNotFoundError(
-            f"Encontrei links na página, mas nenhum parece ser anexo do RMD: {page_url}"
-        )
+        raise FileNotFoundError(f"Encontrei links na página, mas nenhum parece ser anexo do RMD: {page_url}")
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     best = scored[0]
@@ -467,12 +677,6 @@ def find_rmd_attachment_in_page(
 
 
 def discover_latest_rmd_on_web(max_lookback_months: int = 18) -> dict:
-    """
-    Estratégia robusta:
-    1) tenta a página mensal específica;
-    2) se falhar, tenta a página-base do RMD;
-    3) recua mês a mês.
-    """
     errors = []
 
     for year, month in iter_recent_year_months(max_lookback_months=max_lookback_months):
@@ -487,11 +691,6 @@ def discover_latest_rmd_on_web(max_lookback_months: int = 18) -> dict:
                     target_month=month,
                 )
                 return {
-                    "source_type": "web",
-                    "source_label": "Portal Tesouro Transparente",
-                    "source_signature": (
-                        f"web|{found['page_url']}|{found['attachment_url']}"
-                    ),
                     "page_url": found["page_url"],
                     "attachment_url": found["attachment_url"],
                     "anchor_text": found["anchor_text"],
@@ -528,11 +727,7 @@ def download_file_to_temp(url: str, suffix: str | None = None) -> str:
 
         if ".zip" in final_url or "zip" in content_type:
             suffix = ".zip"
-        elif (
-            ".xlsx" in final_url
-            or "spreadsheetml" in content_type
-            or "excel" in content_type
-        ):
+        elif ".xlsx" in final_url or "spreadsheetml" in content_type or "excel" in content_type:
             suffix = ".xlsx"
         elif ".pdf" in final_url or "pdf" in content_type:
             suffix = ".pdf"
@@ -545,11 +740,6 @@ def download_file_to_temp(url: str, suffix: str | None = None) -> str:
 
 
 def extract_excel_from_zip(zip_path: str) -> tuple[str, str]:
-    """
-    Extrai o primeiro .xlsx relevante do ZIP.
-    Retorna:
-      (excel_path, temp_extract_dir)
-    """
     extract_dir = tempfile.mkdtemp(prefix="rmd_zip_")
 
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -557,9 +747,7 @@ def extract_excel_from_zip(zip_path: str) -> tuple[str, str]:
 
     excel_files = [p for p in Path(extract_dir).rglob("*.xlsx") if p.is_file()]
     if not excel_files:
-        raise FileNotFoundError(
-            f"Nenhum arquivo .xlsx foi encontrado dentro do ZIP: {zip_path}"
-        )
+        raise FileNotFoundError(f"Nenhum arquivo .xlsx foi encontrado dentro do ZIP: {zip_path}")
 
     def rank_excel_inside_zip(path: Path):
         name = normalize_text(path.name)
@@ -574,24 +762,25 @@ def extract_excel_from_zip(zip_path: str) -> tuple[str, str]:
     return str(excel_files[0]), extract_dir
 
 
-def materialize_rmd_excel(source_info: dict) -> tuple[str, list[str], list[str]]:
+def resolve_rmd_excel_path(rmd_file: Optional[str]) -> tuple[str | None, list[str], list[str]]:
     """
-    Converte a origem escolhida em um caminho local de Excel pronto para o pipeline.
     Retorna:
       excel_path, temp_files, temp_dirs
     """
     temp_files: list[str] = []
     temp_dirs: list[str] = []
 
-    if source_info["source_type"] == "local":
-        return source_info["local_path"], temp_files, temp_dirs
+    if rmd_file:
+        p = Path(rmd_file)
+        if not p.exists():
+            raise FileNotFoundError(f"RMD_FILE não encontrado: {p.resolve()}")
+        return str(p), temp_files, temp_dirs
 
-    attachment_url = source_info["attachment_url"]
-    downloaded_path = download_file_to_temp(attachment_url)
+    found = discover_latest_rmd_on_web(max_lookback_months=RMD_LOOKBACK_MONTHS)
+    downloaded_path = download_file_to_temp(found["attachment_url"])
     temp_files.append(downloaded_path)
 
     lower = downloaded_path.lower()
-
     if lower.endswith(".xlsx"):
         return downloaded_path, temp_files, temp_dirs
 
@@ -600,176 +789,13 @@ def materialize_rmd_excel(source_info: dict) -> tuple[str, list[str], list[str]]
         temp_dirs.append(extract_dir)
         return excel_path, temp_files, temp_dirs
 
-    raise ValueError(
-        f"O arquivo baixado da web não é XLSX nem ZIP: {downloaded_path}"
-    )
-
-
-def discover_preferred_rmd_source(cfg: dict) -> dict:
-    """
-    Estratégia:
-    1) tenta web;
-    2) se falhar, usa o RMD local mais recente da pasta configurada.
-    """
-    local_dir = get_rmd_search_dir_from_config(cfg)
-
-    try:
-        return discover_latest_rmd_on_web(max_lookback_months=18)
-    except Exception as web_exc:
-        latest_local = find_latest_local_rmd_file(local_dir)
-        return {
-            "source_type": "local",
-            "source_label": "Repositório local",
-            "source_signature": f"local|{current_file_signature(latest_local)}",
-            "local_path": str(latest_local),
-            "fallback_reason": str(web_exc),
-        }
+    raise ValueError(f"O arquivo baixado do RMD não é XLSX nem ZIP: {downloaded_path}")
 
 
 # =========================================================
-# RMD TABLE (integrado do script RD-Data-Public Debt Table.py)
+# RMD / HELPERS DE EXTRAÇÃO
 # =========================================================
-RMD_REFERENCE_SHEET = "2.1"
-RMD_MONTH_SCAN_ROWS = 60
-
-RMD_ROW_MAP = [
-    {
-        "key": "total_debt",
-        "display": "Federal Public Debt (R$ bn)",
-        "sheet": "2.1",
-        "row_label": ["DPF EM PODER DO PUBLICO", "DPF EM PODER DO PÚBLICO", "DPF", "Divida Publica Federal"],
-        "scale": 1.0,
-        "layout": "periods_in_columns",
-    },
-    {
-        "key": "domestic",
-        "display": "Domestic",
-        "sheet": "2.1",
-        "row_label": ["DPMFi"],
-        "scale": 1.0,
-        "layout": "periods_in_columns",
-    },
-    {
-        "key": "fixed_rate",
-        "display": "Fixed-rate",
-        "sheet": "2.5",
-        "row_label": ["Prefixado", "Fixed-rate", "Fixed rate"],
-        "scale": 1.0,
-        "layout": "periods_in_rows",
-    },
-    {
-        "key": "inflation_linked",
-        "display": "Inflation-linked",
-        "sheet": "2.5",
-        "row_label": [
-            "Indice de Precos",
-            "Indice Precos",
-            "Precos",
-            "Índice de Preços",
-            "Inflation-linked",
-            "Price-indexed",
-            "Price indexed",
-        ],
-        "scale": 1.0,
-        "layout": "periods_in_rows",
-    },
-    {
-        "key": "selic",
-        "display": "Selic rate",
-        "sheet": "2.5",
-        "row_label": ["Taxa Flutuante", "Flutuante", "Floating-rate", "Floating rate", "Selic"],
-        "scale": 1.0,
-        "layout": "periods_in_rows",
-    },
-    {
-        "key": "fx",
-        "display": "FX",
-        "sheet": "2.5",
-        "row_label": ["Cambio", "Câmbio", "'Câmbio", "FX"],
-        "scale": 1.0,
-        "layout": "periods_in_rows",
-    },
-    {
-        "key": "other",
-        "display": "Other",
-        "sheet": "2.5",
-        "row_label": ["Demais", "Other"],
-        "scale": 1.0,
-        "layout": "periods_in_rows",
-    },
-    {
-        "key": "external",
-        "display": "External (R$ bn)",
-        "sheet": "2.1",
-        "row_label": ["DPFe"],
-        "scale": 1.0,
-        "layout": "periods_in_columns",
-    },
-    {
-        "key": "avg_maturity",
-        "display": "Average Maturity (years)",
-        "sheet": "3.7",
-        "row_label": ["DPF", "Divida Publica Federal"],
-        "scale": 1.0,
-        "layout": "periods_in_columns",
-    },
-    {
-        "key": "maturing_12m_rs",
-        "display": "Maturing in 12 months (R$ bn)",
-        "sheet": "3.1",
-        "row_label": ["Ate 12 meses", "Até 12 meses", "Maturing in 12 months"],
-        "scale": 1.0,
-        "layout": "periods_in_rows",
-    },
-]
-
-RMD_PERCENT_AFTER = {
-    "total_debt": ("total_debt", "total_debt"),
-    "domestic": ("domestic", "total_debt"),
-    "fixed_rate": ("fixed_rate", "total_debt"),
-    "inflation_linked": ("inflation_linked", "total_debt"),
-    "selic": ("selic", "total_debt"),
-    "fx": ("fx", "total_debt"),
-    "other": ("other", "total_debt"),
-    "external": ("external", "total_debt"),
-    "maturing_12m_rs": ("maturing_12m_rs", "total_debt"),
-}
-
-RMD_MESES_PT = {
-    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
-    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12
-}
-
-RMD_MESES_EN_CAP = {
-    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
-    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"
-}
-
-
-def rmd_normalize_text(s):
-    if s is None:
-        return ""
-    s = str(s).strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def rmd_normalize_date_text(s):
-    if s is None:
-        return ""
-    s = str(s).strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.replace("-", "/")
-    s = re.sub(r"[^a-z0-9/]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def rmd_month_token_to_datetime(x):
+def month_token_to_datetime(x):
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
 
@@ -782,11 +808,11 @@ def rmd_month_token_to_datetime(x):
             dt = base + timedelta(days=float(x))
             return datetime(dt.year, dt.month, 1)
 
-    s = rmd_normalize_date_text(str(x))
+    s = normalize_date_text(str(x))
 
     m = re.match(r"^(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\s*/\s*(\d{2,4})$", s)
     if m:
-        mes = RMD_MESES_PT[m.group(1)]
+        mes = PT_MESES_MIN[m.group(1)]
         ano_txt = m.group(2)
         ano = 2000 + int(ano_txt) if len(ano_txt) == 2 else int(ano_txt)
         return datetime(ano, mes, 1)
@@ -799,54 +825,10 @@ def rmd_month_token_to_datetime(x):
             ano = 2000 + int(ano_txt) if len(ano_txt) == 2 else int(ano_txt)
             return datetime(ano, mes, 1)
 
-    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d/%m/%y", "%m/%d/%y", "%Y/%m/%d"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            return datetime(dt.year, dt.month, 1)
-        except Exception:
-            pass
-
     return None
 
 
-def rmd_dt_to_en_token(dt):
-    return f"{RMD_MESES_EN_CAP[dt.month]}/{str(dt.year)[-2:]}"
-
-
-def rmd_month_variants(dt):
-    return {
-        rmd_normalize_date_text(rmd_dt_to_en_token(dt)),
-        rmd_normalize_date_text(f"{dt.month:02d}/{str(dt.year)[-2:]}"),
-        rmd_normalize_date_text(f"{dt.month:02d}/{dt.year}"),
-    }
-
-
-def rmd_infer_reference_month_from_filename(file_path):
-    nome = Path(file_path).stem
-    nome_norm = rmd_normalize_text(nome)
-
-    mapa_meses = {
-        "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
-        "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
-        "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
-        "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
-    }
-
-    for mes_txt, mes_num in mapa_meses.items():
-        m = re.search(rf"{mes_txt}[ _-]?(\d{{2,4}})", nome_norm)
-        if m:
-            ano_txt = m.group(1)
-            ano = 2000 + int(ano_txt) if len(ano_txt) == 2 else int(ano_txt)
-            return datetime(ano, mes_num, 1)
-
-    return None
-
-
-def rmd_load_sheet(path, sheet_name):
-    return pd.read_excel(path, sheet_name=sheet_name, header=None, engine="openpyxl")
-
-
-def rmd_find_month_header_general(df, top_n_rows=RMD_MONTH_SCAN_ROWS, min_required=3):
+def find_month_header_general(df, top_n_rows=60, min_required=3):
     best_row = None
     best_map = {}
     max_rows = min(top_n_rows, df.shape[0])
@@ -854,7 +836,7 @@ def rmd_find_month_header_general(df, top_n_rows=RMD_MONTH_SCAN_ROWS, min_requir
     for r in range(max_rows):
         current = {}
         for c in range(df.shape[1]):
-            dt = rmd_month_token_to_datetime(df.iat[r, c])
+            dt = month_token_to_datetime(df.iat[r, c])
             if dt is not None:
                 current[dt] = c
         if len(current) > len(best_map) and len(current) >= min_required:
@@ -862,113 +844,29 @@ def rmd_find_month_header_general(df, top_n_rows=RMD_MONTH_SCAN_ROWS, min_requir
             best_row = r
 
     if best_row is None or not best_map:
-        raise ValueError("Não encontrei a linha de meses na aba.")
+        raise ValueError("Não encontrei linha de meses na aba do RMD.")
 
     return best_row, dict(sorted(best_map.items(), key=lambda x: x[0]))
 
 
-def rmd_find_reference_months(df):
-    return rmd_find_month_header_general(df, top_n_rows=RMD_MONTH_SCAN_ROWS, min_required=6)
-
-
-def rmd_choose_periods(month_cols, file_path=None):
-    meses_disponiveis = sorted(month_cols.keys())
-    main = None
-
-    if file_path is not None:
-        main = rmd_infer_reference_month_from_filename(file_path)
-
-    if main is None:
-        main = meses_disponiveis[-1]
-
-    if main not in meses_disponiveis:
-        raise ValueError(
-            f"O mês de referência {rmd_dt_to_en_token(main)} não foi encontrado nas colunas da aba '{RMD_REFERENCE_SHEET}'."
-        )
-
-    prev = datetime(main.year, main.month, 1) - pd.DateOffset(months=1)
-    prev = datetime(prev.year, prev.month, 1)
-    yoy = datetime(main.year - 1, main.month, 1)
-
-    if prev not in meses_disponiveis:
-        raise ValueError(
-            f"Não encontrei o mês anterior {rmd_dt_to_en_token(prev)} na aba '{RMD_REFERENCE_SHEET}'."
-        )
-    if yoy not in meses_disponiveis:
-        raise ValueError(
-            f"Não encontrei o mesmo mês do ano anterior {rmd_dt_to_en_token(yoy)} na aba '{RMD_REFERENCE_SHEET}'."
-        )
-
-    return main, prev, yoy
-
-
-def rmd_find_period_columns_in_sheet(df, periods, sheet_name):
-    header_row, month_cols = rmd_find_month_header_general(df, top_n_rows=RMD_MONTH_SCAN_ROWS, min_required=3)
-    missing = [rmd_dt_to_en_token(p) for p in periods if p not in month_cols]
-
-    if missing:
-        found = {}
-        for r in range(min(RMD_MONTH_SCAN_ROWS, df.shape[0])):
-            for c in range(df.shape[1]):
-                cell_norm = rmd_normalize_date_text(df.iat[r, c])
-                if not cell_norm:
-                    continue
-                for dt in periods:
-                    if dt in found:
-                        continue
-                    if cell_norm in rmd_month_variants(dt):
-                        found[dt] = c
-        for p in periods:
-            if p not in found and p in month_cols:
-                found[p] = month_cols[p]
-
-        missing = [rmd_dt_to_en_token(p) for p in periods if p not in found]
-        if missing:
-            raise ValueError(
-                f"Não encontrei as colunas dos períodos {missing} na aba '{sheet_name}'."
-            )
-        return header_row, found
-
-    return header_row, {p: month_cols[p] for p in periods}
-
-
-def rmd_find_period_rows_in_sheet(df, periods, sheet_name):
-    found = {}
-    for r in range(df.shape[0]):
-        for c in range(min(4, df.shape[1])):
-            dt = rmd_month_token_to_datetime(df.iat[r, c])
-            if dt is not None:
-                for target in periods:
-                    if target not in found and dt == target:
-                        found[target] = r
-
-    missing = [rmd_dt_to_en_token(p) for p in periods if p not in found]
-    if missing:
-        raise ValueError(
-            f"Não encontrei as linhas dos períodos {missing} na aba '{sheet_name}'."
-        )
-
-    return found
-
-
-def rmd_row_text(df, r, ncols=6):
+def row_text(df, r, ncols=6):
     vals = []
     for c in range(min(ncols, df.shape[1])):
         v = df.iat[r, c]
         if pd.notna(v):
             vals.append(str(v))
-    return rmd_normalize_text(" ".join(vals))
+    return normalize_text_strict(" ".join(vals))
 
 
-def rmd_find_row_by_label(df, target_label, min_row=0):
+def find_row_by_label(df, target_label, min_row=0):
     if isinstance(target_label, (list, tuple, set)):
-        targets = [rmd_normalize_text(x) for x in target_label]
+        targets = [normalize_text_strict(x) for x in target_label]
     else:
-        targets = [rmd_normalize_text(target_label)]
+        targets = [normalize_text_strict(target_label)]
 
     for r in range(min_row, df.shape[0]):
         for c in range(min(4, df.shape[1])):
-            cell = rmd_normalize_text(df.iat[r, c])
+            cell = normalize_text_strict(df.iat[r, c])
             if not cell:
                 continue
             for t in targets:
@@ -976,29 +874,21 @@ def rmd_find_row_by_label(df, target_label, min_row=0):
                     return r
 
     for r in range(min_row, df.shape[0]):
-        txt = rmd_row_text(df, r, ncols=6)
-        if not txt or txt.startswith("anexo"):
+        txt = row_text(df, r, ncols=6)
+        if not txt:
             continue
         for t in targets:
-            if txt == t:
-                return r
-
-    for r in range(min_row, df.shape[0]):
-        txt = rmd_row_text(df, r, ncols=6)
-        if not txt or txt.startswith("anexo"):
-            continue
-        for t in targets:
-            if t in txt:
+            if txt == t or t in txt:
                 return r
 
     raise ValueError(f"Não encontrei a linha '{target_label}'.")
 
 
-def rmd_find_col_by_label(df, target_label, max_scan_rows=80):
+def find_col_by_label(df, target_label, max_scan_rows=80):
     if isinstance(target_label, (list, tuple, set)):
-        targets = [rmd_normalize_text(x) for x in target_label]
+        targets = [normalize_text_strict(x) for x in target_label]
     else:
-        targets = [rmd_normalize_text(target_label)]
+        targets = [normalize_text_strict(target_label)]
 
     best_col = None
     best_score = 0
@@ -1009,7 +899,7 @@ def rmd_find_col_by_label(df, target_label, max_scan_rows=80):
             v = df.iat[r, c]
             if pd.notna(v):
                 textos.append(str(v))
-        txt = rmd_normalize_text(" ".join(textos))
+        txt = normalize_text_strict(" ".join(textos))
         if not txt:
             continue
 
@@ -1031,242 +921,201 @@ def rmd_find_col_by_label(df, target_label, max_scan_rows=80):
     raise ValueError(f"Não encontrei a coluna '{target_label}'.")
 
 
-def rmd_extract_value(df, row_idx, col_idx, scale=1.0):
+def extract_value(df, row_idx, col_idx):
     v = df.iat[row_idx, col_idx]
     if pd.isna(v):
         return None
     try:
-        return float(v) / scale
+        return float(v)
     except Exception:
         return None
 
 
-def build_rmd_raw_table(path):
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Arquivo não encontrado: {path.resolve()}")
+def extract_rmd_series_periods_in_columns(
+    arquivo: str,
+    aba: str,
+    row_label: list[str] | str,
+) -> pd.Series:
+    df_raw = pd.read_excel(arquivo, sheet_name=aba, header=None, engine="openpyxl")
+    header_row, month_cols = find_month_header_general(df_raw, top_n_rows=60, min_required=6)
+    row_idx = find_row_by_label(df_raw, row_label, min_row=header_row + 1)
 
-    df_ref = rmd_load_sheet(path, RMD_REFERENCE_SHEET)
-    _, ref_month_cols = rmd_find_reference_months(df_ref)
-    p1, p2, p3 = rmd_choose_periods(ref_month_cols, file_path=path)
-    periods = [p1, p2, p3]
-    period_labels = [rmd_dt_to_en_token(p) for p in periods]
+    out = {}
+    for dt, col_idx in month_cols.items():
+        val = extract_value(df_raw, row_idx, col_idx)
+        out[dt] = val
 
-    sheets_cache = {RMD_REFERENCE_SHEET: df_ref}
-    values_by_key = {}
-
-    for item in RMD_ROW_MAP:
-        sheet = item["sheet"]
-        if sheet not in sheets_cache:
-            sheets_cache[sheet] = rmd_load_sheet(path, sheet)
-        df = sheets_cache[sheet]
-
-        layout = item.get("layout", "periods_in_columns")
-
-        if layout == "periods_in_columns":
-            header_row, period_cols = rmd_find_period_columns_in_sheet(df, periods, sheet)
-            row_idx = rmd_find_row_by_label(df, item["row_label"], min_row=header_row + 1)
-            vals = []
-            for p in periods:
-                col_idx = period_cols[p]
-                vals.append(rmd_extract_value(df, row_idx, col_idx, scale=item.get("scale", 1.0)))
-            values_by_key[item["key"]] = vals
-
-        elif layout == "periods_in_rows":
-            period_rows = rmd_find_period_rows_in_sheet(df, periods, sheet)
-            col_idx = rmd_find_col_by_label(df, item["row_label"])
-            vals = []
-            for p in periods:
-                row_idx = period_rows[p]
-                vals.append(rmd_extract_value(df, row_idx, col_idx, scale=item.get("scale", 1.0)))
-            values_by_key[item["key"]] = vals
-
-        else:
-            raise ValueError(f"Layout inválido em {item['key']}: {layout}")
-
-    rows = []
-    for item in RMD_ROW_MAP:
-        vals = values_by_key[item["key"]]
-        rows.append([item["key"], item["display"], *vals])
-
-        if item["key"] in RMD_PERCENT_AFTER:
-            ref_key, base_key = RMD_PERCENT_AFTER[item["key"]]
-            ref_vals = values_by_key[ref_key]
-            base_vals = values_by_key[base_key]
-
-            pct_vals = []
-            for a, b in zip(ref_vals, base_vals):
-                if b in (None, 0) or pd.isna(b) or a is None or pd.isna(a):
-                    pct_vals.append(None)
-                else:
-                    pct_vals.append(100 * a / b)
-
-            rows.append([f"{item['key']}_pct", "%", *pct_vals])
-
-    raw = pd.DataFrame(rows, columns=["key", "Item", *period_labels])
-    return raw, period_labels
+    s = pd.Series(out).sort_index()
+    s = pd.to_numeric(s, errors="coerce")
+    return s
 
 
-def build_rmd_presentation_table(raw, period_labels):
-    block = {}
-    i = 0
+def extract_rmd_series_periods_in_rows(
+    arquivo: str,
+    aba: str,
+    col_label: list[str] | str,
+) -> pd.Series:
+    df_raw = pd.read_excel(arquivo, sheet_name=aba, header=None, engine="openpyxl")
+    col_idx = find_col_by_label(df_raw, col_label)
 
-    while i < len(raw):
-        key = raw.iloc[i]["key"]
-        item = raw.iloc[i]["Item"]
-        vals = [raw.iloc[i][p] for p in period_labels]
-        pct_vals = None
+    out = {}
+    for r in range(df_raw.shape[0]):
+        dt = None
+        for c in range(min(4, df_raw.shape[1])):
+            dt = month_token_to_datetime(df_raw.iat[r, c])
+            if dt is not None:
+                break
+        if dt is not None:
+            out[dt] = extract_value(df_raw, r, col_idx)
 
-        if i + 1 < len(raw):
-            next_key = str(raw.iloc[i + 1]["key"])
-            next_item = raw.iloc[i + 1]["Item"]
-            if next_item == "%" and next_key.startswith(str(key)):
-                pct_vals = [raw.iloc[i + 1][p] for p in period_labels]
-                i += 1
-
-        block[key] = {"label": item, "values": vals, "pct": pct_vals}
-        i += 1
-
-    def make_value_pct_row(label, value_key, use_pct=True):
-        vals = block[value_key]["values"]
-        pct = block[value_key]["pct"] if use_pct else [None, None, None]
-        row = [label]
-        for v, p in zip(vals, pct):
-            row.extend([v, p])
-        return row
-
-    def make_value_only_row(label, values):
-        row = [label]
-        for v in values:
-            row.extend([v, None])
-        return row
-
-    presentation_rows = []
-    presentation_rows.append(make_value_pct_row("Federal Public Debt (R$ bn)", "total_debt", True))
-    presentation_rows.append(make_value_pct_row("Domestic", "domestic", True))
-    presentation_rows.append(make_value_pct_row("Fixed-rate", "fixed_rate", True))
-    presentation_rows.append(make_value_pct_row("Inflation-linked", "inflation_linked", True))
-    presentation_rows.append(make_value_pct_row("Selic rate", "selic", True))
-    presentation_rows.append(make_value_pct_row("FX", "fx", True))
-    presentation_rows.append(make_value_pct_row("Other", "other", True))
-    presentation_rows.append(make_value_pct_row("External (R$ bn)", "external", True))
-    presentation_rows.append(["Maturity Profile", None, None, None, None, None, None])
-    presentation_rows.append(make_value_only_row(" Average Maturity (years)", block["avg_maturity"]["values"]))
-    presentation_rows.append(make_value_only_row(" Maturing in 12 months (R$ bn)", block["maturing_12m_rs"]["values"]))
-    presentation_rows.append(make_value_only_row(" Maturing in 12 months (%)", block["maturing_12m_rs"]["pct"]))
-
-    df = pd.DataFrame(
-        presentation_rows,
-        columns=[
-            "Item",
-            f"{period_labels[0]}_value", f"{period_labels[0]}_pct",
-            f"{period_labels[1]}_value", f"{period_labels[1]}_pct",
-            f"{period_labels[2]}_value", f"{period_labels[2]}_pct",
-        ],
-    )
-    return df
+    s = pd.Series(out).sort_index()
+    s = pd.to_numeric(s, errors="coerce")
+    return s
 
 
-def build_rmd_table_for_app(rmd_excel_path: str) -> pd.DataFrame:
-    raw, period_labels = build_rmd_raw_table(rmd_excel_path)
-    return build_rmd_presentation_table(raw, period_labels)
+def last_available_by_year(series: pd.Series) -> pd.Series:
+    if series.empty:
+        return pd.Series(dtype="float64")
+    df = pd.DataFrame({"data": series.index, "valor": series.values})
+    df = df.dropna(subset=["data"]).sort_values("data")
+    df["ano"] = df["data"].dt.year
+    return df.groupby("ano")["valor"].last().sort_index()
 
 
 # =========================================================
-# Execução do pipeline
+# RMD / TESOURO
 # =========================================================
-def run_pipeline_auto(source_info: dict):
-    cfg = get_config()
+def build_rmd_debt_block(rmd_file: Optional[str]) -> pd.DataFrame:
+    cols = [
+        "ano",
+        "gross_lt_commercial_borrowing_usd_bi",
+        "commercial_debt_stock_year_end_usd_bi",
+        "st_debt_usd_bi",
+        "bi_multilateral_debt_pct_total",
+        "st_debt_pct_total",
+        "fc_debt_pct_total",
+        "lt_fixed_rate_debt_pct_total",
+        "roll_over_ratio_pct_debt",
+        "roll_over_ratio_pct_gdp",
+    ]
+
     temp_files: list[str] = []
     temp_dirs: list[str] = []
-    logger = None
-    st_handler = None
 
     try:
-        excel_path, temp_files, temp_dirs = materialize_rmd_excel(source_info)
+        excel_path, temp_files, temp_dirs = resolve_rmd_excel_path(rmd_file)
+        if excel_path is None:
+            return pd.DataFrame(columns=cols)
 
-        cfg["ARQUIVO_RMD"] = excel_path
-        cfg["LOG_TO_CONSOLE"] = False
-        cfg["LOG_TO_FILE"] = True
-
-        logger, log_artifacts = setup_logger(cfg)
-
-        st_handler = StreamlitLogHandler()
-        st_handler.setLevel(logging.INFO)
-        st_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        # Séries do RMD
+        total_debt = extract_rmd_series_periods_in_columns(
+            excel_path,
+            "2.1",
+            ["DPF EM PODER DO PUBLICO", "DPF EM PODER DO PÚBLICO", "DPF"],
         )
-        logger.addHandler(st_handler)
+        external = extract_rmd_series_periods_in_columns(
+            excel_path,
+            "2.1",
+            ["DPFe", "DPFe "],
+        )
+        fixed_rate = extract_rmd_series_periods_in_rows(
+            excel_path,
+            "2.5",
+            ["Prefixado", "Fixed-rate", "Fixed rate"],
+        )
+        fx = extract_rmd_series_periods_in_rows(
+            excel_path,
+            "2.5",
+            ["Cambio", "Câmbio", "'Câmbio", "FX"],
+        )
+        maturing_12m = extract_rmd_series_periods_in_rows(
+            excel_path,
+            "3.1",
+            ["Ate 12 meses", "Até 12 meses", "Maturing in 12 months"],
+        )
 
-        started_at = datetime.now().timestamp()
+        # Consolidação anual: último mês disponível de cada ano
+        total_y = last_available_by_year(total_debt)
+        ext_y = last_available_by_year(external)
+        fixed_y = last_available_by_year(fixed_rate)
+        fx_y = last_available_by_year(fx)
+        mat12_y = last_available_by_year(maturing_12m)
 
-        logger.info("Iniciando execução automática pelo Streamlit.")
-        logger.info("Fonte RMD selecionada: %s", source_info["source_label"])
-        logger.info("ARQUIVO_RMD em uso: %s", cfg["ARQUIVO_RMD"])
+        # Câmbio fim de período para converter BRL -> USD
+        cambio_fim = fetch_sgs(SGS["cambio_fim"], str(START_YEAR), str(END_YEAR))
+        cambio_fim_y = (
+            pd.DataFrame({"ano": cambio_fim.index.year, "cambio_fim": cambio_fim.values})
+            .groupby("ano", as_index=False)
+            .last()
+            .set_index("ano")["cambio_fim"]
+        )
 
-        validate_config(cfg)
+        anos = sorted(
+            set(total_y.index)
+            | set(ext_y.index)
+            | set(fixed_y.index)
+            | set(fx_y.index)
+            | set(mat12_y.index)
+            | set(cambio_fim_y.index)
+        )
 
-        raw = collect_data(cfg, logger)
-        processed, warnings = process_data(raw, cfg, logger)
+        rows = []
+        for ano in anos:
+            total = total_y.get(ano, np.nan)
+            ext = ext_y.get(ano, np.nan)
+            fixed_pct = fixed_y.get(ano, np.nan)
+            fx_pct = fx_y.get(ano, np.nan)
+            mat12 = mat12_y.get(ano, np.nan)
+            cambio = cambio_fim_y.get(ano, np.nan)
 
-        export_tables = build_export_tables(processed, logger)
+            commercial_debt_stock_year_end_usd_bi = np.nan
+            st_debt_usd_bi = np.nan
+            st_debt_pct_total = np.nan
 
-        # ---------------------------------------------------------
-        # NOVA ABA: dados_dpf
-        # ---------------------------------------------------------
-        try:
-            rmd_df = build_rmd_table_for_app(cfg["ARQUIVO_RMD"])
-            logger.info("Tabela RMD integrada com sucesso à saída final.")
-        except Exception as exc:
-            logger.warning("Falha ao montar a aba 'rmd': %s", exc)
-            rmd_df = pd.DataFrame(
+            # Conversão para USD bi usando câmbio fim do ano
+            if pd.notna(ext) and pd.notna(cambio) and cambio not in (0, None):
+                commercial_debt_stock_year_end_usd_bi = ext / cambio
+
+            if pd.notna(mat12) and pd.notna(cambio) and cambio not in (0, None):
+                st_debt_usd_bi = mat12 / cambio
+
+            if pd.notna(mat12) and pd.notna(total) and total not in (0, None):
+                st_debt_pct_total = (mat12 / total) * 100
+
+            rows.append(
                 {
-                    "status": ["erro"],
-                    "detalhe": [str(exc)],
+                    "ano": ano,
+                    # Não identificado diretamente no recorte atual do RMD
+                    "gross_lt_commercial_borrowing_usd_bi": np.nan,
+                    # Proxy: DPFe convertido em USD bi
+                    "commercial_debt_stock_year_end_usd_bi": commercial_debt_stock_year_end_usd_bi,
+                    # Proxy: vencendo em 12 meses convertido em USD bi
+                    "st_debt_usd_bi": st_debt_usd_bi,
+                    # Não identificado diretamente no recorte atual do RMD
+                    "bi_multilateral_debt_pct_total": np.nan,
+                    # Proxy: maturing in 12 months / total debt
+                    "st_debt_pct_total": st_debt_pct_total,
+                    # Proxy: FX (%) da composição
+                    "fc_debt_pct_total": fx_pct,
+                    # Proxy: Fixed-rate (%) da composição
+                    "lt_fixed_rate_debt_pct_total": fixed_pct,
+                    # Não identificado diretamente no recorte atual do RMD
+                    "roll_over_ratio_pct_debt": np.nan,
+                    "roll_over_ratio_pct_gdp": np.nan,
                 }
             )
 
-        export_tables["dados_dpf"] = rmd_df
+        out = pd.DataFrame(rows).sort_values("ano").reset_index(drop=True)
 
-        export_tables = standardize_column_names(export_tables, logger)
+        for col in cols:
+            if col not in out.columns:
+                out[col] = np.nan
 
-        output_path = export_to_excel(export_tables, cfg["OUTPUT_NAME"], logger)
-
-        summary = build_execution_summary(
-            export_tables=export_tables,
-            warnings=warnings,
-            output=output_path,
-            logs=log_artifacts,
-            started_at=started_at,
-        )
-        log_execution_summary(logger, summary, warnings)
-
-        with open(output_path, "rb") as f:
-            excel_bytes = f.read()
-
-        return {
-            "success": True,
-            "source_info": source_info,
-            "source_signature": source_info["source_signature"],
-            "export_tables": export_tables,
-            "warnings": warnings,
-            "summary": summary,
-            "logs": st_handler.messages if st_handler else [],
-            "excel_bytes": excel_bytes,
-            "output_path": str(output_path),
-        }
+        return out[cols]
 
     except Exception as exc:
-        if logger is not None:
-            logger.exception("Falha na execução automática: %s", exc)
-
-        return {
-            "success": False,
-            "source_info": source_info,
-            "source_signature": source_info.get("source_signature"),
-            "error": str(exc),
-            "logs": st_handler.messages if st_handler else [],
-        }
+        print(f"[aviso] Falha ao montar bloco RMD para 'Central Gov Debt and Borrowing': {exc}")
+        return pd.DataFrame(columns=cols)
 
     finally:
         for f in temp_files:
@@ -1279,129 +1128,417 @@ def run_pipeline_auto(source_info: dict):
         for d in temp_dirs:
             try:
                 if d and Path(d).exists():
-                    shutil.rmtree(d, ignore_errors=True)
+                    for p in Path(d).rglob("*"):
+                        try:
+                            if p.is_file():
+                                p.unlink()
+                        except Exception:
+                            pass
+                    Path(d).rmdir()
             except Exception:
                 pass
 
 
 # =========================================================
-# Interface
+# ABA 1 - ECONOMIC DATA
 # =========================================================
-st.set_page_config(
-    page_title="RD Data Dashboard",
-    page_icon="📊",
-    layout="wide",
-)
+def build_economic_data() -> pd.DataFrame:
+    pib_brl = fetch_sgs(SGS["pib_nominal_brl"], str(START_YEAR), str(END_YEAR))
+    pib_usd = fetch_sgs(SGS["pib_nominal_usd"], str(START_YEAR), str(END_YEAR))
+    pib_real = fetch_sgs(SGS["pib_real_growth"], str(START_YEAR), str(END_YEAR))
+    exp_usd = fetch_sgs(SGS["export_usd_bi"], str(START_YEAR), str(END_YEAR))
+    import_usd = fetch_sgs(SGS["import_usd_bi"], str(START_YEAR), str(END_YEAR))
 
-st.title("📊 RD Data Dashboard")
-st.caption(
-    "Execução automática do pipeline com busca web do RMD e, caso falhe, usa arquivo local"
-)
+    df = pd.DataFrame({
+        "ano": pib_brl.index.year,
+        "nominal_gdp_bil_lc": pd.to_numeric(pib_brl.values, errors="coerce") / 1e9,
+        "nominal_gdp_bil_usd": pd.to_numeric(pib_usd.values, errors="coerce") / 1000.0,
+        "real_gdp_growth_pct": pd.to_numeric(pib_real.values, errors="coerce"),
+    }).drop_duplicates("ano").sort_values("ano").reset_index(drop=True)
 
-default_cfg = get_config()
+    pib_pc_usd = fetch_sgs(SGS["pib_per_capita_usd"], str(START_YEAR), str(END_YEAR))
+    pib_pc_df = pd.DataFrame({
+        "ano": pib_pc_usd.index.year,
+        "gdp_per_capita_000s_usd": pd.to_numeric(pib_pc_usd.values, errors="coerce") / 1000.0,
+    }).drop_duplicates("ano")
+    df = df.merge(pib_pc_df, on="ano", how="left")
 
-try:
-    latest_source = discover_preferred_rmd_source(default_cfg)
-    latest_signature = latest_source["source_signature"]
+    try:
+        real_pc = sidra_annual_series_fallback(
+            table_code="6601",
+            target_text="Taxa de crescimento real do PIB per capita",
+            value_name="real_gdp_per_capita_growth_pct",
+            aliases=[
+                "crescimento real do pib per capita",
+                "taxa de crescimento real do produto interno bruto per capita",
+                "pib per capita",
+            ],
+        )
+        df = df.merge(real_pc, on="ano", how="left")
+    except Exception:
+        df["real_gdp_per_capita_growth_pct"] = np.nan
 
-    should_run = (
-        "rd_result" not in st.session_state
-        or st.session_state.get("rd_result", {}).get("source_signature") != latest_signature
+    exp_df = pd.DataFrame({
+        "ano": exp_usd.index.year,
+        "exports_usd_bi": exp_usd.values,
+    }).drop_duplicates("ano")
+    imp_df = pd.DataFrame({
+        "ano": import_usd.index.year,
+        "imports_usd_bi": import_usd.values,
+    }).drop_duplicates("ano")
+
+    df = df.merge(exp_df, on="ano", how="left").merge(imp_df, on="ano", how="left")
+    df["exports_gdp_pct"] = ((df["exports_usd_bi"] / df["nominal_gdp_bil_usd"]) * 100) / 1000.0
+
+    try:
+        inv = sidra_quarterly_single_series_mean_by_year(
+            table_code="6727",
+            value_name="investment_gdp_pct",
+            period="all",
+        )
+        df = df.merge(inv, on="ano", how="left")
+    except Exception as e:
+        print(f"[aviso] Falha ao usar SIDRA 6727 para investment_gdp_pct: {e}")
+        df["investment_gdp_pct"] = np.nan
+
+    try:
+        fbc_real_tri = sidra_quarterly_named_series(
+            table_code="5932",
+            target_text="Formação bruta de capital",
+            value_name="fbc_var_volume_tri",
+            aliases=["formacao bruta de capital", "fbcf", "formação bruta de capital fixo"],
+        )
+        fbc_real_tri["ano"] = fbc_real_tri["data"].dt.year
+        real_inv = (
+            fbc_real_tri.groupby("ano", as_index=False)["fbc_var_volume_tri"]
+            .mean()
+            .rename(columns={"fbc_var_volume_tri": "real_investment_growth_pct"})
+        )
+        df = df.merge(real_inv, on="ano", how="left")
+    except Exception:
+        df["real_investment_growth_pct"] = np.nan
+
+    try:
+        savings = sidra_quarterly_single_series_mean_by_year(
+            table_code="6726",
+            value_name="savings_gdp_pct",
+            period="all",
+        )
+        df = df.merge(savings, on="ano", how="left")
+    except Exception as e:
+        print(f"[aviso] Falha ao usar SIDRA 6726 para taxa de poupança: {e}")
+        df["savings_gdp_pct"] = np.nan
+
+    try:
+        desemp_4099 = sidra_unemployment_4099_mean_by_year("all")
+        df = df.merge(desemp_4099, on="ano", how="left")
+    except Exception as e:
+        print(f"[aviso] Falha ao usar SIDRA 4099 para unemployment_rate_pct_workforce: {e}")
+        df["unemployment_rate_pct_workforce"] = np.nan
+
+    for col in [
+        "gdp_per_capita_000s_usd",
+        "real_gdp_per_capita_growth_pct",
+        "real_investment_growth_pct",
+        "investment_gdp_pct",
+        "savings_gdp_pct",
+        "exports_gdp_pct",
+        "unemployment_rate_pct_workforce",
+    ]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    cols = [
+        "ano",
+        "nominal_gdp_bil_lc",
+        "nominal_gdp_bil_usd",
+        "gdp_per_capita_000s_usd",
+        "real_gdp_growth_pct",
+        "real_gdp_per_capita_growth_pct",
+        "real_investment_growth_pct",
+        "investment_gdp_pct",
+        "savings_gdp_pct",
+        "exports_gdp_pct",
+        "unemployment_rate_pct_workforce",
+    ]
+    return df[cols]
+
+
+# =========================================================
+# ABA 2 - MONETARY DATA
+# =========================================================
+def build_monetary_data() -> pd.DataFrame:
+    ipca = fetch_sgs(SGS["ipca_12m"], str(START_YEAR), str(END_YEAR))
+    cambio_fim = fetch_sgs(SGS["cambio_fim"], str(START_YEAR), str(END_YEAR))
+    credito_total = fetch_sgs(SGS["credito_total_brl"], str(START_YEAR), str(END_YEAR))
+    credito_pct_pib = fetch_sgs(SGS["credito_total_pct_pib"], str(START_YEAR), str(END_YEAR))
+    deflator_1211 = fetch_sgs(SGS["deflator_implicito"], str(START_YEAR), str(END_YEAR))
+
+    anos = sorted(
+        set(ipca.index.year)
+        | set(cambio_fim.index.year)
+        | set(credito_total.index.year)
+        | set(credito_pct_pib.index.year)
+        | set(deflator_1211.index.year)
+    )
+    df = pd.DataFrame({"ano": anos})
+
+    df = df.merge(
+        pd.DataFrame({
+            "ano": ipca.index.year,
+            "cpi_growth_pct": ipca.values
+        }).groupby("ano", as_index=False).last(),
+        on="ano",
+        how="left",
     )
 
-    if should_run:
-        with st.spinner("Localizando a fonte mais recente do RMD e executando o pipeline..."):
-            st.session_state["rd_result"] = run_pipeline_auto(latest_source)
+    df = df.merge(
+        pd.DataFrame({
+            "ano": deflator_1211.index.year,
+            "gdp_deflator_growth_pct": pd.to_numeric(deflator_1211.values, errors="coerce"),
+        }).drop_duplicates("ano"),
+        on="ano",
+        how="left",
+    )
 
-    result = st.session_state.get("rd_result")
+    df = df.merge(
+        pd.DataFrame({
+            "ano": cambio_fim.index.year,
+            "exchange_rate_year_end_lc_per_usd": cambio_fim.values
+        }).groupby("ano", as_index=False).last(),
+        on="ano",
+        how="left",
+    )
 
-    if result:
-        source_info = result.get("source_info", {})
+    credito_df = (
+        pd.DataFrame({
+            "ano": credito_total.index.year,
+            "credito_total_brl": credito_total.values
+        })
+        .groupby("ano", as_index=False)
+        .last()
+        .sort_values("ano")
+    )
+    credito_df["banks_claims_growth_pct"] = credito_df["credito_total_brl"].pct_change() * 100
 
-        if result["success"]:
-            st.success("Pipeline executado com sucesso.")
+    credito_pib_df = (
+        pd.DataFrame({
+            "ano": credito_pct_pib.index.year,
+            "banks_claims_gdp_pct": credito_pct_pib.values
+        })
+        .groupby("ano", as_index=False)
+        .last()
+    )
 
-            st.subheader("Fonte do RMD utilizada")
-            st.write(f"**Origem:** {source_info.get('source_label', '-')}")
-            st.write(f"**Tipo:** {source_info.get('source_type', '-')}")
+    df = df.merge(credito_df[["ano", "banks_claims_growth_pct"]], on="ano", how="left")
+    df = df.merge(credito_pib_df, on="ano", how="left")
 
-            if source_info.get("source_type") == "web":
-                st.markdown(f"**Página do RMD:** {source_info.get('page_url', '-')}")
-                st.markdown(f"**Anexo localizado:** {source_info.get('attachment_url', '-')}")
-                if source_info.get("anchor_text"):
-                    st.write(f"**Texto do link do anexo:** {source_info['anchor_text']}")
-                if source_info.get("score") is not None:
-                    st.write(f"**Score do candidato selecionado:** {source_info['score']}")
-                if source_info.get("source_attr"):
-                    st.write(f"**Atributo HTML usado:** {source_info['source_attr']}")
-            else:
-                st.write(f"**Arquivo local:** {source_info.get('local_path', '-')}")
-                if source_info.get("fallback_reason"):
-                    with st.expander("Motivo do fallback local", expanded=False):
-                        st.code(source_info["fallback_reason"])
+    df["fx_share_claims_pct"] = np.nan
+    df["fx_share_deposits_pct"] = np.nan
+    df["reer_growth_pct"] = np.nan
 
-            st.subheader("Resumo da execução")
-            summary = result["summary"]
+    cols = [
+        "ano",
+        "cpi_growth_pct",
+        "gdp_deflator_growth_pct",
+        "exchange_rate_year_end_lc_per_usd",
+        "banks_claims_growth_pct",
+        "banks_claims_gdp_pct",
+        "fx_share_claims_pct",
+        "fx_share_deposits_pct",
+        "reer_growth_pct",
+    ]
+    return df[cols]
 
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Abas exportadas", summary.get("sheet_count", 0))
-            col2.metric("Linhas exportadas", summary.get("total_rows_exported", 0))
-            col3.metric("Colunas exportadas", summary.get("total_columns_exported", 0))
-            col4.metric("Avisos", summary.get("warning_count", 0))
 
-            with st.expander("Detalhes do resumo", expanded=False):
-                st.json(summary)
+# =========================================================
+# ABA 3 - GENERAL GOVERNMENT DATA
+# =========================================================
+def build_general_government_data() -> pd.DataFrame:
+    dbgg = fetch_sgs(SGS["dbgg_pct_pib"], str(START_YEAR), str(END_YEAR))
+    dlsp = fetch_sgs(SGS["dlsp_pct_pib"], str(START_YEAR), str(END_YEAR))
+    primario = fetch_sgs(SGS["resultado_primario_consolidado"], str(START_YEAR), str(END_YEAR))
+    nominal_12m = fetch_sgs(SGS["resultado_nominal_spc_12m"], str(START_YEAR), str(END_YEAR))
 
-            st.download_button(
-                label="📥 Baixar Excel gerado",
-                data=result["excel_bytes"],
-                file_name=Path(summary["output_excel"]).name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    df = pd.DataFrame({"ano": sorted(set(dbgg.index.year) | set(dlsp.index.year))})
 
-            if result["warnings"]:
-                st.subheader("Avisos de validação")
-                for w in result["warnings"]:
-                    st.warning(w)
+    df = df.merge(
+        pd.DataFrame({"ano": dbgg.index.year, "gross_gg_debt_gdp_pct": dbgg.values}).groupby("ano", as_index=False).last(),
+        on="ano", how="left"
+    )
+    df = df.merge(
+        pd.DataFrame({"ano": dlsp.index.year, "net_gg_debt_gdp_pct": dlsp.values}).groupby("ano", as_index=False).last(),
+        on="ano", how="left"
+    )
+    df = df.merge(
+        pd.DataFrame({"ano": primario.index.year, "primary_gg_balance_gdp_pct": primario.values}).groupby("ano", as_index=False).last(),
+        on="ano", how="left"
+    )
+    df = df.merge(
+        pd.DataFrame({"ano": nominal_12m.index.year, "gg_balance_gdp_pct": nominal_12m.values}).groupby("ano", as_index=False).last(),
+        on="ano", how="left"
+    )
 
-            with st.expander("Logs da execução", expanded=False):
-                for msg in result["logs"]:
-                    st.text(msg)
+    df = df.sort_values("ano").reset_index(drop=True)
+    df["change_in_net_gg_debt_gdp_pct"] = df["net_gg_debt_gdp_pct"].diff()
+    df["liquid_assets_gdp_pct"] = df["gross_gg_debt_gdp_pct"] - df["net_gg_debt_gdp_pct"]
 
-            st.subheader("Pré-visualização das abas")
-            st.caption("Exibindo automaticamente até 50 linhas mais recentes por aba.")
+    df["gg_revenues_gdp_pct"] = np.nan
+    df["gg_expenditures_gdp_pct"] = np.nan
+    df["gg_interest_expenditure_revenues_pct"] = np.nan
+    df["debt_revenues_pct"] = np.nan
 
-            export_tables = result["export_tables"]
-            tab_names = list(export_tables.keys())
-            tabs = st.tabs(tab_names)
+    cols = [
+        "ano",
+        "gg_balance_gdp_pct",
+        "change_in_net_gg_debt_gdp_pct",
+        "primary_gg_balance_gdp_pct",
+        "gg_revenues_gdp_pct",
+        "gg_expenditures_gdp_pct",
+        "gg_interest_expenditure_revenues_pct",
+        "gross_gg_debt_gdp_pct",
+        "debt_revenues_pct",
+        "net_gg_debt_gdp_pct",
+        "liquid_assets_gdp_pct",
+    ]
+    return df[cols]
 
-            for tab, sheet_name in zip(tabs, tab_names):
-                with tab:
-                    df = export_tables[sheet_name]
-                    df_view = prepare_preview_df(df, max_rows=50)
 
-                    st.write(f"**Aba:** {sheet_name}")
-                    st.write(f"Linhas: {len(df)} | Colunas: {len(df.columns)}")
-                    st.dataframe(df_view, use_container_width=True)
+# =========================================================
+# ABA 4 - BALANCE OF PAYMENTS DATA
+# =========================================================
+def build_balance_of_payments_data() -> pd.DataFrame:
+    tc_pct = fetch_sgs(SGS["transacoes_correntes_pct_pib"], str(START_YEAR), str(END_YEAR))
+    idp_pct = fetch_sgs(SGS["idp_pct_pib"], str(START_YEAR), str(END_YEAR))
+    exp = fetch_sgs(SGS["export_usd_bi"], str(START_YEAR), str(END_YEAR))
+    imp = fetch_sgs(SGS["import_usd_bi"], str(START_YEAR), str(END_YEAR))
+    pib_usd = fetch_sgs(SGS["pib_nominal_usd"], str(START_YEAR), str(END_YEAR))
 
-                    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        label=f"Baixar CSV da aba {sheet_name}",
-                        data=csv_bytes,
-                        file_name=f"{sheet_name}.csv",
-                        mime="text/csv",
-                        key=f"csv_{sheet_name}",
-                    )
+    df = pd.DataFrame({"ano": sorted(set(tc_pct.index.year) | set(idp_pct.index.year))})
 
-        else:
-            st.error("A execução automática falhou.")
-            st.code(result.get("error", "Erro não detalhado."))
+    df = df.merge(
+        pd.DataFrame({"ano": tc_pct.index.year, "current_account_balance_gdp_pct": tc_pct.values}).groupby("ano", as_index=False).last(),
+        on="ano", how="left"
+    )
+    df = df.merge(
+        pd.DataFrame({"ano": idp_pct.index.year, "net_fdi_gdp_pct": idp_pct.values}).groupby("ano", as_index=False).last(),
+        on="ano", how="left"
+    )
 
-            if result.get("logs"):
-                with st.expander("Logs da execução", expanded=True):
-                    for msg in result["logs"]:
-                        st.text(msg)
+    exp_df = pd.DataFrame({"ano": exp.index.year, "exports_usd_bi": exp.values}).drop_duplicates("ano")
+    imp_df = pd.DataFrame({"ano": imp.index.year, "imports_usd_bi": imp.values}).drop_duplicates("ano")
+    pib_df = pd.DataFrame({"ano": pib_usd.index.year, "nominal_gdp_bil_usd": pib_usd.values / 1000.0}).drop_duplicates("ano")
 
-except Exception as exc:
-    st.error("Não foi possível inicializar o dashboard.")
-    st.code(str(exc))
+    df = df.merge(exp_df, on="ano", how="left").merge(imp_df, on="ano", how="left").merge(pib_df, on="ano", how="left")
+
+    df["trade_balance_gdp_pct"] = ((df["exports_usd_bi"] - df["imports_usd_bi"]) / df["nominal_gdp_bil_usd"]) * 100
+    df["real_exports_growth_pct"] = df["exports_usd_bi"].pct_change() * 100
+    df["cars_gdp_pct"] = np.nan
+    df["current_account_balance_cars_pct"] = np.nan
+    df["usable_reserves_caps_months"] = np.nan
+    df["gross_ext_fin_needs_over_car_plus_res_pct"] = np.nan
+    df["net_portfolio_equity_inflow_gdp_pct"] = np.nan
+
+    cols = [
+        "ano",
+        "cars_gdp_pct",
+        "real_exports_growth_pct",
+        "current_account_balance_gdp_pct",
+        "current_account_balance_cars_pct",
+        "usable_reserves_caps_months",
+        "gross_ext_fin_needs_over_car_plus_res_pct",
+        "net_fdi_gdp_pct",
+        "trade_balance_gdp_pct",
+        "net_portfolio_equity_inflow_gdp_pct",
+    ]
+    return df[cols]
+
+
+# =========================================================
+# ABA 5 - EXTERNAL BALANCE SHEET
+# =========================================================
+def build_external_balance_sheet() -> pd.DataFrame:
+    reservas = fetch_sgs(SGS["reservas_internacionais_usd_bi"], str(START_YEAR), str(END_YEAR))
+
+    df = pd.DataFrame({"ano": sorted(set(reservas.index.year))})
+
+    res_df = pd.DataFrame({
+        "ano": reservas.index.year,
+        "usable_reserves_usd_bi": reservas.values,
+    }).drop_duplicates("ano")
+    df = df.merge(res_df, on="ano", how="left")
+
+    df["usable_reserves_usd_mil"] = df["usable_reserves_usd_bi"] * 1000
+    df["narrow_net_ext_debt_cars_pct"] = np.nan
+    df["narrow_net_ext_debt_caps_pct"] = np.nan
+    df["net_ext_liabilities_cars_pct"] = np.nan
+    df["st_external_debt_remaining_maturity_cars_pct"] = np.nan
+
+    cols = [
+        "ano",
+        "narrow_net_ext_debt_cars_pct",
+        "narrow_net_ext_debt_caps_pct",
+        "net_ext_liabilities_cars_pct",
+        "st_external_debt_remaining_maturity_cars_pct",
+        "usable_reserves_usd_mil",
+    ]
+    return df[cols]
+
+
+# =========================================================
+# ABA 6 - CENTRAL GOV DEBT AND BORROWING DATA
+# =========================================================
+def build_central_government_debt_and_borrowing_data() -> pd.DataFrame:
+    return build_rmd_debt_block(RMD_FILE)
+
+
+# =========================================================
+# EXPORTAÇÃO
+# =========================================================
+def export_to_excel(tabelas: dict[str, pd.DataFrame], output_name: str):
+    output = Path(output_name)
+
+    with pd.ExcelWriter(
+        output,
+        engine="openpyxl",
+        datetime_format="YYYY-MM-DD",
+        date_format="YYYY-MM-DD",
+    ) as writer:
+        for nome_aba, df in tabelas.items():
+            sheet = nome_aba[:31]
+            df.to_excel(writer, sheet_name=sheet, index=False)
+            ws = writer.sheets[sheet]
+            ws.freeze_panes = "B2"
+            for idx, col in enumerate(df.columns, start=1):
+                values = df[col].head(1000).fillna("").astype(str).tolist()
+                max_len = max([len(str(col))] + [len(v) for v in values])
+                ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max_len + 2, 28)
+
+    print(f"Arquivo exportado com sucesso: {output.resolve()}")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    economic = build_economic_data()
+    monetary = build_monetary_data()
+    fiscal = build_general_government_data()
+    bop = build_balance_of_payments_data()
+    ebs = build_external_balance_sheet()
+    debt = build_central_government_debt_and_borrowing_data()
+
+    tabelas = {
+        "Economic Data": economic,
+        "Monetary Data": monetary,
+        "General Government Data": fiscal,
+        "Balance-Of-Payments Data": bop,
+        "External Balance Sheet": ebs,
+        "Central Gov Debt and Borrowing": debt,
+    }
+
+    export_to_excel(tabelas, OUTPUT_NAME)
+
+
+if __name__ == "__main__":
+    main()
