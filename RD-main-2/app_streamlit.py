@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
-import unicodedata
+import time
 import tempfile
+import unicodedata
 import zipfile
 from io import StringIO
 from pathlib import Path
@@ -14,7 +15,9 @@ import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
 from sidrapy import get_table
+from urllib3.util.retry import Retry
 
 
 # =========================================================
@@ -80,27 +83,13 @@ SGS = {
     "credito_total_pct_pib": 20622,
 
     # Setor externo mensal
-    "transacoes_correntes_mensal": 22701,
     "transacoes_correntes_pct_pib": 23079,
-    "conta_capital_mensal": 22851,
-    "conta_financeira_mensal": 22863,
-    "idp_mensal": 22885,
     "idp_pct_pib": 23080,
 
     # Fiscal mensal
-    "resultado_primario_governo_central": 5497,
     "resultado_primario_consolidado": 5793,
-    "resultado_nominal_gc_corrente": 4573,
-    "resultado_primario_gc_corrente": 4639,
-    "resultado_nominal_gc_12m": 5002,
-    "resultado_primario_gc_12m": 5068,
-    "resultado_nominal_spc_corrente": 4583,
-    "resultado_primario_spc_corrente": 4649,
     "resultado_nominal_spc_12m": 5012,
-    "resultado_primario_spc_12m": 5078,
-    "dbgg_valor": 13761,
     "dbgg_pct_pib": 13762,
-    "dlsp_valor": 4478,
     "dlsp_pct_pib": 4513,
 }
 
@@ -154,23 +143,144 @@ def normalize_date_text(s: str) -> str:
     return s
 
 
-def fetch_sgs(code: int, start_year: str, end_year: str | None = None) -> pd.Series:
-    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados?formato=json&dataInicial=01/01/{start_year}"
-    if end_year:
-        url += f"&dataFinal=31/12/{end_year}"
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
+# =========================================================
+# SGS ROBUSTO
+# =========================================================
+def _build_requests_session() -> requests.Session:
+    """
+    Sessão HTTP com retry para erros transitórios do endpoint do BCB.
+    """
+    session = requests.Session()
+
+    retry = Retry(
+        total=5,
+        read=5,
+        connect=5,
+        backoff_factor=1.2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+        }
+    )
+    return session
+
+
+def _fetch_sgs_window(
+    session: requests.Session,
+    code: int,
+    start_date: datetime,
+    end_date: datetime,
+) -> pd.DataFrame:
+    """
+    Busca uma janela única do SGS.
+    """
+    url = (
+        f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
+        f"?formato=json&dataInicial={start_date.strftime('%d/%m/%Y')}"
+        f"&dataFinal={end_date.strftime('%d/%m/%Y')}"
+    )
+
+    r = session.get(url, timeout=90)
+
+    if r.status_code >= 400:
+        raise requests.HTTPError(
+            f"SGS HTTP {r.status_code} para série {code} "
+            f"no intervalo {start_date:%d/%m/%Y} - {end_date:%d/%m/%Y}. "
+            f"URL: {url}",
+            response=r,
+        )
+
+    if not r.text or not r.text.strip():
+        return pd.DataFrame(columns=["data", "valor"])
+
     df = pd.read_json(StringIO(r.text))
     if df.empty:
-        return pd.Series(dtype="float64")
+        return pd.DataFrame(columns=["data", "valor"])
+
+    if "data" not in df.columns or "valor" not in df.columns:
+        raise ValueError(
+            f"Resposta inesperada do SGS para série {code}. Colunas recebidas: {list(df.columns)}"
+        )
+
     df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
     df["valor"] = pd.to_numeric(
         df["valor"].astype(str).str.replace(",", ".", regex=False),
         errors="coerce",
     )
-    return df.set_index("data")["valor"].sort_index()
+    df = df.dropna(subset=["data"]).sort_values("data").reset_index(drop=True)
+    return df
 
 
+def fetch_sgs(code: int, start_year: str, end_year: str | None = None) -> pd.Series:
+    """
+    Versão blindada:
+    - respeita a limitação oficial de até 10 anos por consulta;
+    - usa retries;
+    - evita pedir data final futura no ano corrente;
+    - concatena múltiplas janelas.
+    """
+    start_year_int = int(start_year)
+    end_year_int = int(end_year) if end_year else datetime.today().year
+
+    start_date = datetime(start_year_int, 1, 1)
+
+    today = datetime.today()
+    if end_year_int >= today.year:
+        end_date = today
+    else:
+        end_date = datetime(end_year_int, 12, 31)
+
+    if end_date < start_date:
+        return pd.Series(dtype="float64")
+
+    session = _build_requests_session()
+    chunks = []
+
+    current_start = start_date
+
+    while current_start <= end_date:
+        current_end = min(
+            datetime(current_start.year + 9, 12, 31),
+            end_date,
+        )
+
+        df_chunk = _fetch_sgs_window(session, code, current_start, current_end)
+        if not df_chunk.empty:
+            chunks.append(df_chunk)
+
+        current_start = current_end + timedelta(days=1)
+        time.sleep(0.2)
+
+    if not chunks:
+        return pd.Series(dtype="float64")
+
+    df = (
+        pd.concat(chunks, ignore_index=True)
+        .drop_duplicates(subset=["data"], keep="last")
+        .sort_values("data")
+        .reset_index(drop=True)
+    )
+
+    return df.set_index("data")["valor"]
+
+
+# =========================================================
+# HELPERS SIDRA
+# =========================================================
 def _find_text_cols(raw: pd.DataFrame) -> List[str]:
     return [c for c in raw.columns if c.startswith("D") and (c.endswith("C") or c.endswith("N"))]
 
@@ -187,18 +297,17 @@ def _build_normalized_mask(
     search_terms: List[str],
     text_cols: Optional[List[str]] = None,
 ) -> pd.Series:
-    """
-    Procura os termos em todas as colunas textuais do raw,
-    com normalização de acentos/caixa/espaços.
-    """
     if text_cols is None:
         text_cols = _find_text_cols(raw)
+
     search_terms_norm = [normalize_text(x) for x in search_terms if x]
     mask = pd.Series(False, index=raw.index)
+
     for c in text_cols:
         col_norm = raw[c].astype(str).map(normalize_text)
         for term in search_terms_norm:
             mask = mask | col_norm.str.contains(term, regex=False, na=False)
+
     return mask
 
 
@@ -283,9 +392,6 @@ def _parse_quarter_to_timestamp(s: str) -> pd.Timestamp:
     raise ValueError(f"Período trimestral inesperado: {s}")
 
 
-# =========================================================
-# HELPERS SIDRA
-# =========================================================
 def sidra_annual_named_series(
     table_code: str,
     target_text: str,
@@ -541,7 +647,7 @@ def fetch_html(url: str, timeout: int = 60) -> str:
     return resp.text
 
 
-def collect_link_candidates_from_html(page_url: str, html: str) -> list[dict]:
+def collect_link_candidates_from_html(page_url: str, html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
     candidates = []
 
@@ -572,6 +678,42 @@ def collect_link_candidates_from_html(page_url: str, html: str) -> list[dict]:
         add_candidate(tag.get("data-url"), tag.get_text(" ", strip=True), "data-url")
 
     return candidates
+
+
+def month_number_to_pt_name(month: int) -> str:
+    mapping = {
+        1: "Janeiro",
+        2: "Fevereiro",
+        3: "Março",
+        4: "Abril",
+        5: "Maio",
+        6: "Junho",
+        7: "Julho",
+        8: "Agosto",
+        9: "Setembro",
+        10: "Outubro",
+        11: "Novembro",
+        12: "Dezembro",
+    }
+    return mapping[month]
+
+
+def month_number_to_pt_name_ascii(month: int) -> str:
+    mapping = {
+        1: "Janeiro",
+        2: "Fevereiro",
+        3: "Marco",
+        4: "Abril",
+        5: "Maio",
+        6: "Junho",
+        7: "Julho",
+        8: "Agosto",
+        9: "Setembro",
+        10: "Outubro",
+        11: "Novembro",
+        12: "Dezembro",
+    }
+    return mapping[month]
 
 
 def score_attachment_candidate(candidate: dict, target_year: int | None = None, target_month: int | None = None) -> int:
@@ -610,42 +752,6 @@ def score_attachment_candidate(candidate: dict, target_year: int | None = None, 
             score += 4
 
     return score
-
-
-def month_number_to_pt_name(month: int) -> str:
-    mapping = {
-        1: "Janeiro",
-        2: "Fevereiro",
-        3: "Março",
-        4: "Abril",
-        5: "Maio",
-        6: "Junho",
-        7: "Julho",
-        8: "Agosto",
-        9: "Setembro",
-        10: "Outubro",
-        11: "Novembro",
-        12: "Dezembro",
-    }
-    return mapping[month]
-
-
-def month_number_to_pt_name_ascii(month: int) -> str:
-    mapping = {
-        1: "Janeiro",
-        2: "Fevereiro",
-        3: "Marco",
-        4: "Abril",
-        5: "Maio",
-        6: "Junho",
-        7: "Julho",
-        8: "Agosto",
-        9: "Setembro",
-        10: "Outubro",
-        11: "Novembro",
-        12: "Dezembro",
-    }
-    return mapping[month]
 
 
 def find_rmd_attachment_in_page(page_url: str, target_year: int | None = None, target_month: int | None = None) -> dict:
@@ -1007,7 +1113,6 @@ def build_rmd_debt_block(rmd_file: Optional[str]) -> pd.DataFrame:
         if excel_path is None:
             return pd.DataFrame(columns=cols)
 
-        # Séries do RMD
         total_debt = extract_rmd_series_periods_in_columns(
             excel_path,
             "2.1",
@@ -1034,14 +1139,12 @@ def build_rmd_debt_block(rmd_file: Optional[str]) -> pd.DataFrame:
             ["Ate 12 meses", "Até 12 meses", "Maturing in 12 months"],
         )
 
-        # Consolidação anual: último mês disponível de cada ano
         total_y = last_available_by_year(total_debt)
         ext_y = last_available_by_year(external)
         fixed_y = last_available_by_year(fixed_rate)
         fx_y = last_available_by_year(fx)
         mat12_y = last_available_by_year(maturing_12m)
 
-        # Câmbio fim de período para converter BRL -> USD
         cambio_fim = fetch_sgs(SGS["cambio_fim"], str(START_YEAR), str(END_YEAR))
         cambio_fim_y = (
             pd.DataFrame({"ano": cambio_fim.index.year, "cambio_fim": cambio_fim.values})
@@ -1072,7 +1175,6 @@ def build_rmd_debt_block(rmd_file: Optional[str]) -> pd.DataFrame:
             st_debt_usd_bi = np.nan
             st_debt_pct_total = np.nan
 
-            # Conversão para USD bi usando câmbio fim do ano
             if pd.notna(ext) and pd.notna(cambio) and cambio not in (0, None):
                 commercial_debt_stock_year_end_usd_bi = ext / cambio
 
@@ -1085,21 +1187,13 @@ def build_rmd_debt_block(rmd_file: Optional[str]) -> pd.DataFrame:
             rows.append(
                 {
                     "ano": ano,
-                    # Não identificado diretamente no recorte atual do RMD
                     "gross_lt_commercial_borrowing_usd_bi": np.nan,
-                    # Proxy: DPFe convertido em USD bi
                     "commercial_debt_stock_year_end_usd_bi": commercial_debt_stock_year_end_usd_bi,
-                    # Proxy: vencendo em 12 meses convertido em USD bi
                     "st_debt_usd_bi": st_debt_usd_bi,
-                    # Não identificado diretamente no recorte atual do RMD
                     "bi_multilateral_debt_pct_total": np.nan,
-                    # Proxy: maturing in 12 months / total debt
                     "st_debt_pct_total": st_debt_pct_total,
-                    # Proxy: FX (%) da composição
                     "fc_debt_pct_total": fx_pct,
-                    # Proxy: Fixed-rate (%) da composição
                     "lt_fixed_rate_debt_pct_total": fixed_pct,
-                    # Não identificado diretamente no recorte atual do RMD
                     "roll_over_ratio_pct_debt": np.nan,
                     "roll_over_ratio_pct_gdp": np.nan,
                 }
@@ -1408,30 +1502,74 @@ def build_general_government_data() -> pd.DataFrame:
 # ABA 4 - BALANCE OF PAYMENTS DATA
 # =========================================================
 def build_balance_of_payments_data() -> pd.DataFrame:
-    tc_pct = fetch_sgs(SGS["transacoes_correntes_pct_pib"], str(START_YEAR), str(END_YEAR))
-    idp_pct = fetch_sgs(SGS["idp_pct_pib"], str(START_YEAR), str(END_YEAR))
-    exp = fetch_sgs(SGS["export_usd_bi"], str(START_YEAR), str(END_YEAR))
-    imp = fetch_sgs(SGS["import_usd_bi"], str(START_YEAR), str(END_YEAR))
-    pib_usd = fetch_sgs(SGS["pib_nominal_usd"], str(START_YEAR), str(END_YEAR))
+    def try_fetch(code_key: str) -> pd.Series:
+        try:
+            return fetch_sgs(SGS[code_key], str(START_YEAR), str(END_YEAR))
+        except Exception as exc:
+            print(f"[aviso] Falha ao buscar SGS '{code_key}' ({SGS[code_key]}): {exc}")
+            return pd.Series(dtype="float64")
 
-    df = pd.DataFrame({"ano": sorted(set(tc_pct.index.year) | set(idp_pct.index.year))})
+    tc_pct = try_fetch("transacoes_correntes_pct_pib")
+    idp_pct = try_fetch("idp_pct_pib")
+    exp = try_fetch("export_usd_bi")
+    imp = try_fetch("import_usd_bi")
+    pib_usd = try_fetch("pib_nominal_usd")
 
-    df = df.merge(
-        pd.DataFrame({"ano": tc_pct.index.year, "current_account_balance_gdp_pct": tc_pct.values}).groupby("ano", as_index=False).last(),
-        on="ano", how="left"
+    anos = sorted(
+        set(tc_pct.index.year)
+        | set(idp_pct.index.year)
+        | set(exp.index.year)
+        | set(imp.index.year)
+        | set(pib_usd.index.year)
     )
-    df = df.merge(
-        pd.DataFrame({"ano": idp_pct.index.year, "net_fdi_gdp_pct": idp_pct.values}).groupby("ano", as_index=False).last(),
-        on="ano", how="left"
+    df = pd.DataFrame({"ano": anos})
+
+    if not tc_pct.empty:
+        df = df.merge(
+            pd.DataFrame({
+                "ano": tc_pct.index.year,
+                "current_account_balance_gdp_pct": tc_pct.values
+            }).groupby("ano", as_index=False).last(),
+            on="ano", how="left"
+        )
+    else:
+        df["current_account_balance_gdp_pct"] = np.nan
+
+    if not idp_pct.empty:
+        df = df.merge(
+            pd.DataFrame({
+                "ano": idp_pct.index.year,
+                "net_fdi_gdp_pct": idp_pct.values
+            }).groupby("ano", as_index=False).last(),
+            on="ano", how="left"
+        )
+    else:
+        df["net_fdi_gdp_pct"] = np.nan
+
+    if not exp.empty:
+        exp_df = pd.DataFrame({"ano": exp.index.year, "exports_usd_bi": exp.values}).drop_duplicates("ano")
+        df = df.merge(exp_df, on="ano", how="left")
+    else:
+        df["exports_usd_bi"] = np.nan
+
+    if not imp.empty:
+        imp_df = pd.DataFrame({"ano": imp.index.year, "imports_usd_bi": imp.values}).drop_duplicates("ano")
+        df = df.merge(imp_df, on="ano", how="left")
+    else:
+        df["imports_usd_bi"] = np.nan
+
+    if not pib_usd.empty:
+        pib_df = pd.DataFrame({"ano": pib_usd.index.year, "nominal_gdp_bil_usd": pib_usd.values / 1000.0}).drop_duplicates("ano")
+        df = df.merge(pib_df, on="ano", how="left")
+    else:
+        df["nominal_gdp_bil_usd"] = np.nan
+
+    df["trade_balance_gdp_pct"] = np.where(
+        df["nominal_gdp_bil_usd"].notna() & (df["nominal_gdp_bil_usd"] != 0),
+        ((df["exports_usd_bi"] - df["imports_usd_bi"]) / df["nominal_gdp_bil_usd"]) * 100,
+        np.nan,
     )
 
-    exp_df = pd.DataFrame({"ano": exp.index.year, "exports_usd_bi": exp.values}).drop_duplicates("ano")
-    imp_df = pd.DataFrame({"ano": imp.index.year, "imports_usd_bi": imp.values}).drop_duplicates("ano")
-    pib_df = pd.DataFrame({"ano": pib_usd.index.year, "nominal_gdp_bil_usd": pib_usd.values / 1000.0}).drop_duplicates("ano")
-
-    df = df.merge(exp_df, on="ano", how="left").merge(imp_df, on="ano", how="left").merge(pib_df, on="ano", how="left")
-
-    df["trade_balance_gdp_pct"] = ((df["exports_usd_bi"] - df["imports_usd_bi"]) / df["nominal_gdp_bil_usd"]) * 100
     df["real_exports_growth_pct"] = df["exports_usd_bi"].pct_change() * 100
     df["cars_gdp_pct"] = np.nan
     df["current_account_balance_cars_pct"] = np.nan
