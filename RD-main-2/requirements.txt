@@ -1,0 +1,7 @@
+streamlit==1.55.0
+openpyxl
+python-bcb
+sidrapy
+lxml
+requests
+beautifulsoup4
