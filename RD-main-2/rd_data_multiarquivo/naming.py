@@ -12,6 +12,7 @@ def get_rename_maps() -> dict:
         "Mensal_Monetario": {
             **rename_common,
             "IPCA_acumulado_doze_meses": "ipca_acumulado_12_meses",
+            "IPCA_mensal": "ipca_mensal",
             "IGP_DI_mensal": "igp_di_mensal",
             "Selic_acumulada_no_mes": "selic_acumulada_mes",
             "Cambio_medio_mensal": "cambio_medio_mensal",
