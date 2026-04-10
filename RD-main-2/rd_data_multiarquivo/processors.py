@@ -127,6 +127,7 @@ def prepare_monthly_data(dados_mensais: pd.DataFrame, cfg: dict) -> tuple[pd.Dat
     dados_precos = dados_mensais[
         [
             "IPCA_acumulado_doze_meses",
+            "IPCA_mensal",
             "IGP_DI_mensal",
             "Selic_acumulada_no_mes",
             "Reservas_estoque",
