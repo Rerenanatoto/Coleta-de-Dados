@@ -8,8 +8,9 @@ def get_config() -> dict:
     }
 
     series_mensais = {
-        # preços
+        # precos
         "IPCA_acumulado_doze_meses": 13522,
+        "IPCA_mensal": 433,
         "IGP_DI_mensal": 190,
         "Selic_acumulada_no_mes": 4390,
         "Reservas_estoque": 3546,
@@ -77,7 +78,7 @@ def get_config() -> dict:
         "MES_ALVO": "Dez",
         "ANO_INICIO_RMD": 2020,
 
-        # Saída
+        # Saida
         "OUTPUT_NAME": "Recent Developments Data.xlsx",
 
         # Auxiliares
