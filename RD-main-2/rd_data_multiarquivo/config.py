@@ -69,7 +69,7 @@ def get_config() -> dict:
 
     return {
         # Coleta
-        "START_SGS": "2019-01-01",
+        "START_SGS": "2000-01-01",
         "DAYS_DAILY_SGS": 7,
 
         # Agora aponta para a pasta-base; o app localiza automaticamente o RMD mais recente
