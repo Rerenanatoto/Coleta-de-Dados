@@ -31,7 +31,7 @@ def get_config() -> dict:
         "IDP_%_do_PIB": 23080,
 
         # fiscal
-        "ResultadoPrimGovernoCentral": 5497,
+        "ResultadoPrimGovernoCentral": 5783,
         "ResultadoPrimConsolidado": 5793,
         "ResultadoGovCentralNominalCorrente": 4573,
         "ResultadoGovCentralPrimarioCorrente": 4639,
